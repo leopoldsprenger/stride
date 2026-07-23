@@ -37,7 +37,7 @@ The database is stored at `~/.local/share/stride/stride.db`. It uses SQLite’s 
 | `Enter` | Task details (centered floating window) |
 | `e` | Edit title, description, tags, list, and project |
 | `x` | Mark complete |
-| `m` | Move to Inbox, Today, Upcoming, Anytime, or Someday |
+| `m` | Move to Inbox, Today, Upcoming, Anytime, Someday, or press `p` for a project |
 | `?` | Show shortcuts |
 | `q` | Quit |
 
