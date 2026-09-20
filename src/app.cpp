@@ -97,6 +97,7 @@ void App::draw() {
 }
 
 void App::drawSidebar(int rows, int width) {
+  sidebarRows_.clear();
   attron(A_BOLD | COLOR_PAIR(1));
   mvprintw(1, 2, "\xe2\x97\x89 STRIDE");
   attroff(A_BOLD | COLOR_PAIR(1));
@@ -106,6 +107,7 @@ void App::drawSidebar(int rows, int width) {
     if (cur) attron(A_REVERSE);
     mvprintw(5 + i, 2, "%s %s", cur ? "\xe2\x96\xa3" : "\xe2\x97\x8b", clip(views_[i], width - 6).c_str());
     if (cur) attroff(A_REVERSE);
+    sidebarRows_.push_back({5 + i, {'v', i}});
   }
   int y = 5 + (int)views_.size() + 1;
   mvprintw(y++, 2, "AREAS");
@@ -113,14 +115,18 @@ void App::drawSidebar(int rows, int width) {
     if (y >= rows - 3) break;
     bool cur = scopeKind_ == 'a' && scope_ == a.id;
     if (cur) attron(A_REVERSE);
-    mvprintw(y++, 2, "\xe2\x97\x88 %s", clip(a.name, width - 6).c_str());
+    mvprintw(y, 2, "\xe2\x97\x88 %s", clip(a.name, width - 6).c_str());
     if (cur) attroff(A_REVERSE);
+    sidebarRows_.push_back({y, {'a', a.id}});
+    ++y;
     for (auto& p : s_.projectsInArea(a.id)) {
       if (y >= rows - 3) break;
       bool curp = scopeKind_ == 'p' && scope_ == p.id;
       if (curp) attron(A_REVERSE);
-      mvprintw(y++, 4, "\xe2\x96\xb9 %s", clip(p.name, width - 8).c_str());
+      mvprintw(y, 4, "\xe2\x96\xb9 %s", clip(p.name, width - 8).c_str());
       if (curp) attroff(A_REVERSE);
+      sidebarRows_.push_back({y, {'p', p.id}});
+      ++y;
     }
   }
   for (auto& p : s_.projects()) {
@@ -128,11 +134,13 @@ void App::drawSidebar(int rows, int width) {
     if (y >= rows - 3) break;
     bool curp = scopeKind_ == 'p' && scope_ == p.id;
     if (curp) attron(A_REVERSE);
-    mvprintw(y++, 2, "\xe2\x97\x87 %s", clip(p.name, width - 6).c_str());
+    mvprintw(y, 2, "\xe2\x97\x87 %s", clip(p.name, width - 6).c_str());
     if (curp) attroff(A_REVERSE);
+    sidebarRows_.push_back({y, {'p', p.id}});
+    ++y;
   }
   attron(A_DIM);
-  mvprintw(rows - 2, 2, "%s", clip("f find  b sidebar", width - 4).c_str());
+  mvprintw(rows - 2, 2, "%s", clip("click to jump \xc2\xb7 right-click item: actions", width - 4).c_str());
   attroff(A_DIM);
   mvvline(0, width, ACS_VLINE, rows);
 }
@@ -161,6 +169,7 @@ void App::drawIconStrip(int y, int cols, const Item& x) {
 }
 
 void App::drawMain(int rows, int cols, int off) {
+  mainRows_.clear();
   int innerW = cols - off - 4;
   attron(A_BOLD);
   mvprintw(1, off + 3, "%s", clip(name(), innerW - 20).c_str());
@@ -224,6 +233,7 @@ void App::drawMain(int rows, int cols, int off) {
       }
     }
     bool selected = rowSelected(i);
+    mainRows_.push_back({y, i});
     if (selected) attron(A_REVERSE);
     int indent = off + 4;
     if (scopeKind_ == 'p' && x.kind == 't' && x.headingId != 0) indent += 2;
@@ -484,12 +494,14 @@ void App::checklistEditor(Item t) {
 
 void App::help() {
   std::vector<std::string> lines = {
+      "Mouse           click to select/navigate \xc2\xb7 click selected row to open",
+      "                right-click any row for its actions menu",
+      "",
       "j/k            move selection",
       "h/l, Esc       switch list / go back",
       "J/K            reorder (crosses into a heading)",
       "Enter          edit task \xc2\xb7 open project \xc2\xb7 rename/delete heading",
-      "n / p / a      new task / project / area",
-      "N              new heading (inside a project)",
+      "n              new... (task / project / area / heading)",
       "c              edit the selected task's checklist",
       "e              edit selected item",
       "x              complete task, or lifecycle for project/area",
@@ -704,6 +716,126 @@ void App::bulkSetDate(bool deadline) {
 // input dispatch
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// mouse: click to select/navigate, right-click for a contextual actions menu
+// (fewer shortcuts to memorize -- everything reachable by keyboard here is
+// still available on the keys documented in help(), this just adds a
+// second, discoverable way in, closer to how Things 3 itself works).
+// ---------------------------------------------------------------------------
+
+void App::showActionsMenu(int index) {
+  if (index < 0 || index >= (int)list_.size()) return;
+  pick_ = index;
+  showActionsMenuFor(list_[index]);
+}
+
+void App::showActionsMenuFor(const Item& x) {
+  bool open = x.status == "open";
+
+  std::vector<PickerItem> opts;
+  auto add = [&](const char* icon, const std::string& label, char code) { opts.push_back({icon, label, "", code, x}); };
+
+  if (x.kind == 't') {
+    add(open ? "\xe2\x9c\x93" : "\xe2\x86\xba", open ? "Complete" : "Reopen", 'x');
+    add("\xe2\x9c\x8e", "Edit...", 'e');
+    add("\xe2\x86\x92", "Move to project...", 'm');
+    add("\xe2\x98\x91", "Edit checklist...", 'c');
+    if (!open) add("\xf0\x9f\x97\x91", "Delete permanently", 'd');
+  } else if (x.kind == 'p' || x.kind == 'a') {
+    if (x.kind == 'p') add("\xe2\x86\xb5", "Open", '\n');
+    add("\xe2\x9c\x8e", "Edit...", 'e');
+    if (open) add("\xe2\x9a\x99", "Complete / cancel / delete...", 'L');
+    else {
+      add("\xe2\x86\xba", "Reopen", 'x');
+      add("\xf0\x9f\x97\x91", "Delete permanently", 'd');
+    }
+  } else if (x.kind == 'h') {
+    add("\xe2\x9c\x8e", "Rename / delete...", 'H');
+  }
+  if (opts.empty()) return;
+
+  int r = runPicker(x.title, opts);
+  if (r < 0) return;
+  switch (opts[r].kind) {
+    case 'x':
+      if (x.kind == 't') s_.complete(x);
+      else s_.reopen(x);
+      break;
+    case 'e':
+      if (x.kind == 't') taskForm(x);
+      else if (x.kind == 'p') projectForm(x);
+      else if (x.kind == 'a') areaForm(x);
+      break;
+    case 'm': {
+      int pid = pickProject("MOVE TO PROJECT");
+      if (pid >= 0) s_.moveTask(x.id, pid ? s_.projectAreaId(pid) : 0, pid);
+      break;
+    }
+    case 'c': checklistEditor(x); break;
+    case 'L': lifecycle(x); break;
+    case 'd':
+      if (x.kind == 't') s_.erase(x);
+      else if (confirmDialog("Delete \"" + x.title + "\" permanently?")) s_.erase(x);
+      break;
+    case '\n': openContainer('p', x.id, x.title, x.areaName); break;
+    case 'H': headingLifecycle(x); break;
+  }
+}
+
+void App::handleMouse() {
+  MEVENT ev;
+  if (getmouse(&ev) != OK) return;
+  bool leftClick = ev.bstate & (BUTTON1_CLICKED | BUTTON1_PRESSED | BUTTON1_DOUBLE_CLICKED);
+  bool rightClick = ev.bstate & (BUTTON3_CLICKED | BUTTON3_PRESSED);
+  if (!leftClick && !rightClick) return;
+
+  for (auto& [y, target] : sidebarRows_) {
+    if (ev.y != y) continue;
+    if (target.kind == 'v') {
+      view_ = target.idOrView;
+      scopeKind_ = 0;
+      hidden_.clear();
+      pick_ = 0;
+    } else if (target.kind == 'a') {
+      std::string areaName;
+      for (auto& a : s_.areas())
+        if (a.id == target.idOrView) areaName = a.name;
+      if (rightClick) {
+        // drawSidebar only ever lists open areas (areas(false)), so this is
+        // always "open" -- no need to look status up.
+        Item x;
+        x.id = target.idOrView;
+        x.kind = 'a';
+        x.title = areaName;
+        x.status = "open";
+        showActionsMenuFor(x);
+      } else {
+        openContainer('a', target.idOrView, areaName, "");
+      }
+    } else if (target.kind == 'p') {
+      Item p = s_.getProject(target.idOrView);
+      if (rightClick) showActionsMenuFor(p);
+      else openContainer('p', p.id, p.title, p.areaName);
+    }
+    return;
+  }
+
+  for (auto& [y, idx] : mainRows_) {
+    if (ev.y != y) continue;
+    if (rightClick) {
+      showActionsMenu(idx);
+    } else if (ev.bstate & BUTTON1_DOUBLE_CLICKED) {
+      pick_ = idx;
+      handle('\n');
+    } else if (pick_ == idx) {
+      handle('\n');  // clicking the already-selected row opens/edits it
+    } else {
+      pick_ = idx;
+    }
+    return;
+  }
+}
+
 void App::handle(int k) {
   if (visual_) {
     if (k == 27 || k == 'v') {
@@ -751,21 +883,34 @@ void App::handle(int k) {
     return;
   }
   if (k == 'n') {
-    int presetHeading = 0, afterSort = -1;
-    if (scopeKind_ == 'p' && !list_.empty()) {
-      Item& sel = list_[pick_];
-      if (sel.kind == 'h') presetHeading = sel.id;
-      else if (sel.kind == 't') {
-        presetHeading = sel.headingId;
-        afterSort = sel.sortOrder;
+    std::vector<PickerItem> opts = {
+        {"\xe2\x97\x8b", "New Task", "", 't', Item{}},
+        {"\xe2\x97\x87", "New Project", "", 'p', Item{}},
+        {"\xe2\x97\x88", "New Area", "", 'a', Item{}},
+    };
+    if (scopeKind_ == 'p') opts.push_back({"\xe2\x80\x94", "New Heading", "", 'h', Item{}});
+    int r = runPicker("NEW\xe2\x80\xa6", opts);
+    if (r < 0) return;
+    switch (opts[r].kind) {
+      case 't': {
+        int presetHeading = 0, afterSort = -1;
+        if (scopeKind_ == 'p' && !list_.empty()) {
+          Item& sel = list_[pick_];
+          if (sel.kind == 'h') presetHeading = sel.id;
+          else if (sel.kind == 't') {
+            presetHeading = sel.headingId;
+            afterSort = sel.sortOrder;
+          }
+        }
+        taskForm({}, presetHeading, afterSort);
+        break;
       }
+      case 'p': projectForm(); break;
+      case 'a': areaForm(); break;
+      case 'h': headingForm(); break;
     }
-    taskForm({}, presetHeading, afterSort);
     return;
   }
-  if (k == 'p') { projectForm(); return; }
-  if (k == 'a') { areaForm(); return; }
-  if (k == 'N' && scopeKind_ == 'p') { headingForm(); return; }
   if (k == 'c' && !list_.empty() && list_[pick_].kind == 't') { checklistEditor(list_[pick_]); return; }
   if (k == 'f') { find(); return; }
   if (k == 'm' && !list_.empty() && list_[pick_].kind == 't') {
@@ -830,6 +975,8 @@ void App::run() {
   init_pair(2, COLOR_RED, -1);
   init_pair(3, COLOR_YELLOW, -1);
   init_pair(4, COLORS >= 16 ? 8 : COLOR_WHITE, -1);
+  mousemask(ALL_MOUSE_EVENTS | REPORT_MOUSE_POSITION, NULL);
+  mouseinterval(0);  // report clicks immediately rather than trying to pair them into one down+up event
   // Opt in to the Kitty keyboard protocol / xterm modifyOtherKeys reporting,
   // which is what lets Shift+Enter be told apart from plain Enter. Terminals
   // that don't understand this simply ignore it.
@@ -838,7 +985,9 @@ void App::run() {
   while (on_) {
     load();
     draw();
-    handle(getch());
+    int k = getch();
+    if (k == KEY_MOUSE) handleMouse();
+    else handle(k);
   }
   fputs("\x1b[<1u", stdout);
   fflush(stdout);

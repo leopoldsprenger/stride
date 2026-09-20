@@ -15,6 +15,11 @@ add_executable(stride
   src/form.cpp
   src/finder.cpp
   src/app.cpp
+  src/mirror.cpp
+  src/mirror_import.cpp
+  src/config.cpp
+  src/sync.cpp
+  src/things_import.cpp
 )
 target_include_directories(stride PRIVATE ${NCURSESW_INCLUDE_DIRS} ${SQLITE3_INCLUDE_DIRS})
 target_link_libraries(stride PRIVATE ${NCURSESW_LIBRARIES} ${SQLITE3_LIBRARIES})

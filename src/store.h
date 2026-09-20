@@ -5,6 +5,7 @@
 #include <sqlite3.h>
 
 #include <functional>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -43,12 +44,27 @@ class Store {
   std::vector<Item> viewProject(int projectId, const std::string& tf, bool projectIsOpen);
   Item getProject(int id);
 
+  // -- full raw dumps, for the mirror exporter (every row, any status) --------
+  std::vector<Item> allAreas();
+  std::vector<Item> allProjects();
+  std::vector<Item> allTasks();
+  std::vector<Item> allHeadings();  // headingId doubles as id here; projectId set
+
+  // -- Things-import bookkeeping (idempotent re-imports by source uuid) -------
+  int findByThingsUuid(char kind, const std::string& uuid);
+  void setThingsUuid(char kind, int id, const std::string& uuid);
+
+  // -- cross-device identity, for git-mirror reconciliation --------------------
+  int findByStrideUuid(char kind, const std::string& uuid);
+  void setStrideUuid(char kind, int id, const std::string& uuid);
+  std::map<int, std::string> strideUuids(char kind);  // id -> uuid, whole table in one query
+
   // -- mutation ---------------------------------------------------------------
   int saveTask(Item t, int areaId, int projectId);  // returns the task's id
   void insertTaskAfter(int taskId, int afterSortOrder);
-  void saveProject(Item p, int areaId);
+  int saveProject(Item p, int areaId);  // returns the project's id
   void renameArea(int id, const std::string& name);
-  void addArea(const std::string& name);
+  int addArea(const std::string& name);  // returns the area's id
   int addHeading(int projectId, const std::string& title);
   void renameHeading(int id, const std::string& title);
   void deleteHeading(int id);

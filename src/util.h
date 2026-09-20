@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <ctime>
 #include <filesystem>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -192,4 +193,51 @@ inline std::filesystem::path dataDir() {
   if (const char* xdg = std::getenv("XDG_DATA_HOME")) return std::filesystem::path(xdg) / "stride";
   return base / ".local/share/stride";
 #endif
+}
+
+// Random UUID v4 (hex, RFC-4122 variant bits set). Used as the stable,
+// cross-device identity for every area/project/task/heading -- local
+// autoincrement ids only mean something on the machine that assigned them,
+// but two Stride installs need to recognize "this is the same item" when
+// reconciling the git mirror. Not cryptographically sensitive, just needs
+// to not collide in practice.
+inline std::string genUuid() {
+  static std::random_device rd;
+  static std::mt19937_64 gen(rd());
+  static std::uniform_int_distribution<int> hexd(0, 15);
+  const char* hex = "0123456789abcdef";
+  std::string s;
+  s.reserve(36);
+  for (int i = 0; i < 36; ++i) {
+    if (i == 8 || i == 13 || i == 18 || i == 23) {
+      s += '-';
+    } else if (i == 14) {
+      s += '4';
+    } else if (i == 19) {
+      s += hex[8 + (hexd(gen) & 3)];  // variant bits 10xx
+    } else {
+      s += hex[hexd(gen)];
+    }
+  }
+  return s;
+}
+
+// Lowercase, filesystem- and git-diff-friendly slug: keeps alphanumerics,
+// collapses everything else to single hyphens, trims them from the ends.
+// Used only for mirror file names, never for identity (ids own that).
+inline std::string slugify(const std::string& s) {
+  std::string out;
+  bool lastDash = false;
+  for (unsigned char c : s) {
+    if (isalnum(c)) {
+      out += (char)tolower(c);
+      lastDash = false;
+    } else if (!lastDash && !out.empty()) {
+      out += '-';
+      lastDash = true;
+    }
+  }
+  while (!out.empty() && out.back() == '-') out.pop_back();
+  if (out.empty()) out = "untitled";
+  return out;
 }

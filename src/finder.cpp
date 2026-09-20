@@ -55,6 +55,12 @@ std::string bucketLabel(const std::string& completedAtIso) {
 int runPicker(const std::string& title, const std::vector<PickerItem>& items) {
   std::string query;
   int sel = 0;
+  // Same reasoning as openDialog() in form.cpp: force a clean repaint
+  // before opening, in case a previous popup closed without the main loop
+  // getting a redraw in between.
+  touchwin(stdscr);
+  wnoutrefresh(stdscr);
+  doupdate();
   int rows, cols;
   getmaxyx(stdscr, rows, cols);
   int h = std::min(rows - 4, 20), w = std::min(cols - 4, 72);
@@ -117,6 +123,9 @@ std::string runTagPicker(const std::vector<std::string>& existingTags, std::stri
   std::string original = selected;
   std::string query;
   int sel = 0;
+  touchwin(stdscr);
+  wnoutrefresh(stdscr);
+  doupdate();
   int rows, cols;
   getmaxyx(stdscr, rows, cols);
   int h = std::min(rows - 4, 20), w = std::min(cols - 4, 60);

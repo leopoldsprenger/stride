@@ -330,6 +330,68 @@ Item Store::getProject(int id) {
   return r.empty() ? Item{} : r.front();
 }
 
+// -- full raw dumps, for the mirror exporter (every row, any status) ----------
+
+std::vector<Item> Store::allAreas() {
+  return read("SELECT id,'a',name,'','',0,'',0,'',0,'','','',0,status,COALESCE(completed_at,''),sort_order "
+              "FROM areas ORDER BY sort_order,name");
+}
+std::vector<Item> Store::allProjects() { return read(projectSelectBase() + " ORDER BY p.sort_order,p.id"); }
+std::vector<Item> Store::allTasks() {
+  return read(
+      "SELECT t.id,'t',t.title,t.notes,t.checklist,COALESCE(t.area_id,0),COALESCE(a.name,''),"
+      "COALESCE(t.project_id,0),COALESCE(pr.name,''),COALESCE(t.heading_id,0),COALESCE(t.do_date,''),"
+      "COALESCE(t.deadline,''),t.tags,t.someday,t.status,COALESCE(t.completed_at,''),t.sort_order FROM tasks t "
+      "LEFT JOIN areas a ON a.id=t.area_id LEFT JOIN projects pr ON pr.id=t.project_id "
+      "ORDER BY COALESCE(t.project_id,0),COALESCE(t.heading_id,0),t.sort_order,t.id");
+}
+std::vector<Item> Store::allHeadings() {
+  return read(
+      "SELECT id,'h',title,'','',0,'',project_id,'',id,'','','',0,'open','',sort_order "
+      "FROM headings ORDER BY project_id,sort_order,id");
+}
+
+// -- Things-import bookkeeping -------------------------------------------------
+
+int Store::findByThingsUuid(char kind, const std::string& uuid) {
+  auto* s = prep("SELECT id FROM " + std::string(tableFor(kind)) + " WHERE things_uuid=?");
+  bind(s, 1, uuid);
+  int id = 0;
+  if (sqlite3_step(s) == SQLITE_ROW) id = sqlite3_column_int(s, 0);
+  sqlite3_finalize(s);
+  return id;
+}
+void Store::setThingsUuid(char kind, int id, const std::string& uuid) {
+  auto* s = prep("UPDATE " + std::string(tableFor(kind)) + " SET things_uuid=? WHERE id=?");
+  bind(s, 1, uuid);
+  sqlite3_bind_int(s, 2, id);
+  step(s);
+}
+
+// -- cross-device identity ------------------------------------------------
+
+int Store::findByStrideUuid(char kind, const std::string& uuid) {
+  auto* s = prep("SELECT id FROM " + std::string(tableFor(kind)) + " WHERE stride_uuid=?");
+  bind(s, 1, uuid);
+  int id = 0;
+  if (sqlite3_step(s) == SQLITE_ROW) id = sqlite3_column_int(s, 0);
+  sqlite3_finalize(s);
+  return id;
+}
+void Store::setStrideUuid(char kind, int id, const std::string& uuid) {
+  auto* s = prep("UPDATE " + std::string(tableFor(kind)) + " SET stride_uuid=? WHERE id=?");
+  bind(s, 1, uuid);
+  sqlite3_bind_int(s, 2, id);
+  step(s);
+}
+std::map<int, std::string> Store::strideUuids(char kind) {
+  std::map<int, std::string> out;
+  auto* s = prep("SELECT id,stride_uuid FROM " + std::string(tableFor(kind)) + " WHERE stride_uuid IS NOT NULL");
+  while (sqlite3_step(s) == SQLITE_ROW) out[sqlite3_column_int(s, 0)] = (const char*)sqlite3_column_text(s, 1);
+  sqlite3_finalize(s);
+  return out;
+}
+
 // -- mutation ---------------------------------------------------------------
 
 int Store::saveTask(Item t, int areaId, int projectId) {
@@ -350,14 +412,16 @@ int Store::saveTask(Item t, int areaId, int projectId) {
   sqlite3_bind_int(s, 9, t.someday ? 1 : 0);
   if (t.id) sqlite3_bind_int(s, 10, t.id);
   step(s);
-  return t.id ? t.id : (int)sqlite3_last_insert_rowid(db_);
+  int id = t.id ? t.id : (int)sqlite3_last_insert_rowid(db_);
+  if (!t.id) setStrideUuid('t', id, genUuid());
+  return id;
 }
 void Store::insertTaskAfter(int taskId, int afterSortOrder) {
   exec("UPDATE tasks SET sort_order=sort_order+1 WHERE sort_order>" + std::to_string(afterSortOrder) + " AND id<>" +
        std::to_string(taskId));
   exec("UPDATE tasks SET sort_order=" + std::to_string(afterSortOrder + 1) + " WHERE id=" + std::to_string(taskId));
 }
-void Store::saveProject(Item p, int areaId) {
+int Store::saveProject(Item p, int areaId) {
   sqlite3_stmt* s = prep(p.id ? "UPDATE projects SET name=?,description=?,area_id=?,do_date=?,deadline=? WHERE id=?"
                                : "INSERT INTO projects(name,description,area_id,do_date,deadline,sort_order) "
                                  "VALUES(?,?,?,?,?,COALESCE((SELECT MAX(sort_order)+1 FROM projects),0))");
@@ -368,6 +432,9 @@ void Store::saveProject(Item p, int areaId) {
   nullable(s, 5, p.deadline);
   if (p.id) sqlite3_bind_int(s, 6, p.id);
   step(s);
+  int id = p.id ? p.id : (int)sqlite3_last_insert_rowid(db_);
+  if (!p.id) setStrideUuid('p', id, genUuid());
+  return id;
 }
 void Store::renameArea(int id, const std::string& name) {
   sqlite3_stmt* s = prep("UPDATE areas SET name=? WHERE id=?");
@@ -375,8 +442,11 @@ void Store::renameArea(int id, const std::string& name) {
   sqlite3_bind_int(s, 2, id);
   step(s);
 }
-void Store::addArea(const std::string& name) {
+int Store::addArea(const std::string& name) {
   stmt("INSERT INTO areas(name,sort_order) VALUES(?,COALESCE((SELECT MAX(sort_order)+1 FROM areas),0))", {name});
+  int id = (int)sqlite3_last_insert_rowid(db_);
+  setStrideUuid('a', id, genUuid());
+  return id;
 }
 int Store::addHeading(int projectId, const std::string& title) {
   sqlite3_stmt* s = prep(
@@ -386,7 +456,9 @@ int Store::addHeading(int projectId, const std::string& title) {
   bind(s, 2, title);
   sqlite3_bind_int(s, 3, projectId);
   step(s);
-  return (int)sqlite3_last_insert_rowid(db_);
+  int id = (int)sqlite3_last_insert_rowid(db_);
+  setStrideUuid('h', id, genUuid());
+  return id;
 }
 void Store::renameHeading(int id, const std::string& title) {
   sqlite3_stmt* s = prep("UPDATE headings SET title=? WHERE id=?");
@@ -447,10 +519,42 @@ void Store::migrate() {
        "NULL DEFAULT 0,created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);");
   exec("CREATE TABLE IF NOT EXISTS headings(id INTEGER PRIMARY KEY,project_id INTEGER NOT NULL REFERENCES "
        "projects(id) ON DELETE CASCADE,title TEXT NOT NULL,sort_order INTEGER NOT NULL DEFAULT 0);");
-  for (auto q : {"ALTER TABLE tasks ADD COLUMN heading_id INTEGER", "ALTER TABLE tasks ADD COLUMN checklist TEXT NOT NULL DEFAULT ''"}) {
+  for (auto q : {"ALTER TABLE tasks ADD COLUMN heading_id INTEGER", "ALTER TABLE tasks ADD COLUMN checklist TEXT NOT NULL DEFAULT ''",
+                 "ALTER TABLE areas ADD COLUMN things_uuid TEXT", "ALTER TABLE projects ADD COLUMN things_uuid TEXT",
+                 "ALTER TABLE tasks ADD COLUMN things_uuid TEXT", "ALTER TABLE headings ADD COLUMN things_uuid TEXT",
+                 "ALTER TABLE areas ADD COLUMN stride_uuid TEXT", "ALTER TABLE projects ADD COLUMN stride_uuid TEXT",
+                 "ALTER TABLE tasks ADD COLUMN stride_uuid TEXT", "ALTER TABLE headings ADD COLUMN stride_uuid TEXT"}) {
     try {
       exec(q);
     } catch (...) {
+    }
+  }
+  // Partial unique indexes: only rows actually imported from Things carry a
+  // uuid, so re-running the importer can look one up and update in place
+  // instead of creating duplicates.
+  for (auto t : {"areas", "projects", "tasks", "headings"}) {
+    try {
+      exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_" + std::string(t) + "_things_uuid ON " + t +
+           "(things_uuid) WHERE things_uuid IS NOT NULL");
+      exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_" + std::string(t) + "_stride_uuid ON " + t +
+           "(stride_uuid) WHERE stride_uuid IS NOT NULL");
+    } catch (...) {
+    }
+  }
+  // stride_uuid is every row's cross-device identity for git-mirror
+  // reconciliation (see sync.cpp/mirror_import.cpp) -- every row needs one,
+  // including ones that pre-date this column, so backfill once here rather
+  // than only assigning it on new inserts.
+  for (auto t : {"areas", "projects", "tasks", "headings"}) {
+    auto* sel = prep("SELECT id FROM " + std::string(t) + " WHERE stride_uuid IS NULL");
+    std::vector<int> ids;
+    while (sqlite3_step(sel) == SQLITE_ROW) ids.push_back(sqlite3_column_int(sel, 0));
+    sqlite3_finalize(sel);
+    for (int id : ids) {
+      auto* upd = prep("UPDATE " + std::string(t) + " SET stride_uuid=? WHERE id=?");
+      bind(upd, 1, genUuid());
+      sqlite3_bind_int(upd, 2, id);
+      step(upd);
     }
   }
 }

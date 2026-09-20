@@ -6,6 +6,16 @@
 #include "util.h"
 
 WINDOW* openDialog(int h, int w, const std::string& title) {
+  // If a previous popup just closed without the main loop getting a chance
+  // to redraw in between (e.g. one dialog chaining straight into another,
+  // as the 'n' New... menu does into taskForm/projectForm/etc.), stdscr's
+  // logical content is still correct but the physical terminal can still be
+  // showing the old popup's characters underneath where this new, possibly
+  // differently-sized one won't fully cover them. Force a full repaint of
+  // stdscr first so this window always opens over a clean, current screen.
+  touchwin(stdscr);
+  wnoutrefresh(stdscr);
+  doupdate();
   int rows, cols;
   getmaxyx(stdscr, rows, cols);
   h = std::min(h, std::max(3, rows - 2));

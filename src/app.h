@@ -14,6 +14,13 @@ struct GroupKey {
   std::string secondary;
 };
 
+// Where a sidebar row leads: a FOCUS view (kind 'v', idOrView = index into
+// views_), an area (kind 'a'), or a project (kind 'p').
+struct SidebarTarget {
+  char kind;
+  int idOrView;
+};
+
 class App {
  public:
   explicit App(Store& s) : s_(s) {}
@@ -28,6 +35,12 @@ class App {
   std::vector<Item> list_;
   std::vector<std::string> areaOrder_;
   std::vector<std::string> views_{"Inbox", "Today", "Upcoming", "Anytime", "Someday", "Logbook"};
+
+  // Screen-row -> target maps, rebuilt every draw() so mouse clicks (which
+  // only know a row number) can be resolved back to "what's there". Mouse
+  // handling never assumes these are stable between frames.
+  std::vector<std::pair<int, SidebarTarget>> sidebarRows_;
+  std::vector<std::pair<int, int>> mainRows_;  // screen row -> index into list_
 
   std::string active() const;
   std::string name() const;
@@ -74,6 +87,11 @@ class App {
   void bulkMove();
   void bulkTag();
   void bulkSetDate(bool deadline);
+
+  // mouse / contextual actions menu -- see input.md notes in app.cpp for why
+  void handleMouse();
+  void showActionsMenu(int index);       // for a row in the main list_
+  void showActionsMenuFor(const Item& x);  // the shared menu itself; also used for sidebar rows
 
   void handle(int k);
 };
