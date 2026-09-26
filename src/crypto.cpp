@@ -21,13 +21,13 @@ const char kMagic[4] = {'S', 'K', 'E', '1'};
 }
 }  // namespace
 
-Key generateKey() {
-  Key key(kKeyLen);
+CryptoKey generateKey() {
+  CryptoKey key(kKeyLen);
   if (RAND_bytes(key.data(), kKeyLen) != 1) throwOpenSSLError("failed to generate encryption key");
   return key;
 }
 
-std::string keyToHex(const Key& key) {
+std::string keyToHex(const CryptoKey& key) {
   static const char* hex = "0123456789abcdef";
   std::string out;
   out.reserve(key.size() * 2);
@@ -51,7 +51,7 @@ std::string sha256Hex(const std::string& data) {
   return out;
 }
 
-Key keyFromHex(const std::string& hex) {
+CryptoKey keyFromHex(const std::string& hex) {
   if (hex.size() != (size_t)kKeyLen * 2) throw std::runtime_error("encryption key must be exactly 64 hex characters");
   auto nibble = [&](char c) -> int {
     if (c >= '0' && c <= '9') return c - '0';
@@ -59,12 +59,12 @@ Key keyFromHex(const std::string& hex) {
     if (c >= 'A' && c <= 'F') return c - 'A' + 10;
     throw std::runtime_error("encryption key must be hex-encoded");
   };
-  Key key(kKeyLen);
+  CryptoKey key(kKeyLen);
   for (int i = 0; i < kKeyLen; ++i) key[i] = (uint8_t)((nibble(hex[i * 2]) << 4) | nibble(hex[i * 2 + 1]));
   return key;
 }
 
-std::string encryptBlob(const Key& key, const std::string& plaintext) {
+std::string encryptBlob(const CryptoKey& key, const std::string& plaintext) {
   if (key.size() != (size_t)kKeyLen) throw std::runtime_error("encryption key must be 32 bytes");
   uint8_t nonce[kNonceLen];
   if (RAND_bytes(nonce, kNonceLen) != 1) throwOpenSSLError("failed to generate nonce");
@@ -101,7 +101,7 @@ std::string encryptBlob(const Key& key, const std::string& plaintext) {
   return out;
 }
 
-std::string decryptBlob(const Key& key, const std::string& blob) {
+std::string decryptBlob(const CryptoKey& key, const std::string& blob) {
   if (key.size() != (size_t)kKeyLen) throw std::runtime_error("encryption key must be 32 bytes");
   if (blob.size() < 4 + kNonceLen + kTagLen || memcmp(blob.data(), kMagic, 4) != 0)
     throw std::runtime_error("not a recognized encrypted mirror blob (wrong format, or file is corrupted)");

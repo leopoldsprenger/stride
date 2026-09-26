@@ -2,11 +2,50 @@
 
 #include <algorithm>
 #include <clocale>
+#include <csignal>
 #include <cstdio>
+#include <fcntl.h>
+#include <unistd.h>
 
 #include "finder.h"
 #include "form.h"
 #include "input.h"
+
+// ---------------------------------------------------------------------------
+// link opening (ctrl+click on a task/project's title or notes -- see
+// handleMouse and drawMain's descRowRange_)
+// ---------------------------------------------------------------------------
+
+namespace {
+std::string firstUrl(const std::string& s) {
+  for (const char* prefix : {"https://", "http://"}) {
+    size_t p = s.find(prefix);
+    if (p == std::string::npos) continue;
+    size_t end = s.find_first_of(" \t\n\r)]}>\"'", p);
+    return s.substr(p, end == std::string::npos ? std::string::npos : end - p);
+  }
+  return "";
+}
+
+void openUrl(const std::string& url) {
+  if (url.empty()) return;
+  pid_t pid = fork();
+  if (pid == 0) {
+    setsid();
+    int devnull = open("/dev/null", O_RDWR);
+    if (devnull >= 0) {
+      dup2(devnull, 1);
+      dup2(devnull, 2);
+    }
+#if defined(__APPLE__)
+    execlp("open", "open", url.c_str(), (char*)nullptr);
+#else
+    execlp("xdg-open", "xdg-open", url.c_str(), (char*)nullptr);
+#endif
+    _exit(127);
+  }
+}
+}  // namespace
 
 // ---------------------------------------------------------------------------
 // view state
@@ -96,6 +135,23 @@ void App::draw() {
   refresh();
 }
 
+// Prints `label` wrapped to `width` columns starting at (y, x), returning
+// the row after the last line printed. Every wrapped line (not just the
+// first) is registered against `target` in sidebarRows_ so a click anywhere
+// on a wrapped entry resolves to it, and every line but the last gets the
+// reverse-video treatment together when `cur` is set.
+int App::wrapSidebarEntry(int y, int x, int width, const std::string& label, bool cur, SidebarTarget target) {
+  auto lines = wrapText(label, std::max(1, width));
+  for (auto& ln : lines) {
+    if (cur) attron(A_REVERSE);
+    mvprintw(y, x, "%s", clip(ln, width).c_str());
+    if (cur) attroff(A_REVERSE);
+    sidebarRows_.push_back({y, target});
+    ++y;
+  }
+  return y;
+}
+
 void App::drawSidebar(int rows, int width) {
   sidebarRows_.clear();
   attron(A_BOLD | COLOR_PAIR(1));
@@ -105,9 +161,9 @@ void App::drawSidebar(int rows, int width) {
   for (int i = 0; i < (int)views_.size(); ++i) {
     bool cur = scopeKind_ == 0 && hidden_.empty() && i == view_;
     if (cur) attron(A_REVERSE);
-    mvprintw(5 + i, 2, "%s %s", cur ? "\xe2\x96\xa3" : "\xe2\x97\x8b", clip(views_[i], width - 6).c_str());
+    mvprintw(5 + i, 2, "%s", cur ? "\xe2\x96\xa3" : "\xe2\x97\x8b");
     if (cur) attroff(A_REVERSE);
-    sidebarRows_.push_back({5 + i, {'v', i}});
+    wrapSidebarEntry(5 + i, 4, width - 6, views_[i], cur, {'v', i});
   }
   int y = 5 + (int)views_.size() + 1;
   mvprintw(y++, 2, "AREAS");
@@ -115,32 +171,29 @@ void App::drawSidebar(int rows, int width) {
     if (y >= rows - 3) break;
     bool cur = scopeKind_ == 'a' && scope_ == a.id;
     if (cur) attron(A_REVERSE);
-    mvprintw(y, 2, "\xe2\x97\x88 %s", clip(a.name, width - 6).c_str());
+    mvprintw(y, 2, "\xe2\x97\x88");
     if (cur) attroff(A_REVERSE);
-    sidebarRows_.push_back({y, {'a', a.id}});
-    ++y;
-    for (auto& p : s_.projectsInArea(a.id)) {
+    y = wrapSidebarEntry(y, 4, width - 6, a.name, cur, {'a', a.id});
+    for (auto& p : s_.projectsInArea(a.id, /*excludeSomeday=*/true)) {
       if (y >= rows - 3) break;
       bool curp = scopeKind_ == 'p' && scope_ == p.id;
       if (curp) attron(A_REVERSE);
-      mvprintw(y, 4, "\xe2\x96\xb9 %s", clip(p.name, width - 8).c_str());
+      mvprintw(y, 4, "\xe2\x96\xb9");
       if (curp) attroff(A_REVERSE);
-      sidebarRows_.push_back({y, {'p', p.id}});
-      ++y;
+      y = wrapSidebarEntry(y, 6, width - 8, p.name, curp, {'p', p.id});
     }
   }
-  for (auto& p : s_.projects()) {
+  for (auto& p : s_.projects(/*archived=*/false, /*excludeSomeday=*/true)) {
     if (!p.sub.empty()) continue;
     if (y >= rows - 3) break;
     bool curp = scopeKind_ == 'p' && scope_ == p.id;
     if (curp) attron(A_REVERSE);
-    mvprintw(y, 2, "\xe2\x97\x87 %s", clip(p.name, width - 6).c_str());
+    mvprintw(y, 2, "\xe2\x97\x87");
     if (curp) attroff(A_REVERSE);
-    sidebarRows_.push_back({y, {'p', p.id}});
-    ++y;
+    y = wrapSidebarEntry(y, 4, width - 6, p.name, curp, {'p', p.id});
   }
   attron(A_DIM);
-  mvprintw(rows - 2, 2, "%s", clip("click to jump \xc2\xb7 right-click item: actions", width - 4).c_str());
+  mvprintw(rows - 2, 2, "%s", clip("? for shortcuts", width - 4).c_str());
   attroff(A_DIM);
   mvvline(0, width, ACS_VLINE, rows);
 }
@@ -170,6 +223,7 @@ void App::drawIconStrip(int y, int cols, const Item& x) {
 
 void App::drawMain(int rows, int cols, int off) {
   mainRows_.clear();
+  descRowRange_ = {0, 0};
   int innerW = cols - off - 4;
   attron(A_BOLD);
   mvprintw(1, off + 3, "%s", clip(name(), innerW - 20).c_str());
@@ -183,10 +237,15 @@ void App::drawMain(int rows, int cols, int off) {
   int headerRow = 2;
   if (scopeKind_ == 'p' && !scopeDescription_.empty()) {
     auto lines = wrapText(scopeDescription_, innerW);
+    // No more hard 3-line cap -- grow to fit, bounded only by leaving
+    // reasonable room for the list itself on very long descriptions.
+    int maxDescLines = std::max(1, (rows - 8) / 2);
+    int shown = std::min((int)lines.size(), maxDescLines);
     attron(A_DIM);
-    for (int i = 0; i < (int)lines.size() && i < 3; ++i) mvprintw(2 + i, off + 3, "%s", clip(lines[i], innerW).c_str());
+    for (int i = 0; i < shown; ++i) mvprintw(2 + i, off + 3, "%s", clip(lines[i], innerW).c_str());
     attroff(A_DIM);
-    headerRow = 2 + std::min((int)lines.size(), 3);
+    headerRow = 2 + shown;
+    descRowRange_ = {2, headerRow};
   }
   mvhline(headerRow, off + 2, ACS_HLINE, std::max(0, cols - off - 4));
 
@@ -196,65 +255,45 @@ void App::drawMain(int rows, int cols, int off) {
     attroff(A_DIM);
   }
 
-  bool twoLevel = group_ && scopeKind_ == 0;
-  std::string lastPrimary, lastSecondary;
-  bool primarySet = false;
-  int y = headerRow + 2;
-  for (int i = 0; i < (int)list_.size() && y < rows - 2; ++i) {
-    auto& x = list_[i];
-    if (twoLevel) {
-      GroupKey gk = groupKeyFor(x);
-      if (!primarySet || gk.primary != lastPrimary) {
-        if (!gk.primary.empty()) {
-          attron(A_BOLD | COLOR_PAIR(3));
-          mvprintw(y++, off + 3, "%s", clip(gk.primary, innerW).c_str());
-          attroff(A_BOLD | COLOR_PAIR(3));
-        }
-        lastPrimary = gk.primary;
-        lastSecondary.clear();
-        primarySet = true;
-        if (y >= rows - 2) break;
+  int contentTop = headerRow + 2;
+  int viewH = std::max(0, (rows - 2) - contentTop);
+  auto lines = buildMainLines(cols, off);
+  updateScroll(lines, viewH);
+
+  for (int ln = scroll_; ln < (int)lines.size() && ln - scroll_ < viewH; ++ln) {
+    auto& mline = lines[ln];
+    int y = contentTop + (ln - scroll_);
+    if (mline.header) {
+      if (!mline.text.empty()) {
+        bool secondary = mline.indent != off + 3;
+        if (secondary) attron(COLOR_PAIR(3));
+        else attron(A_BOLD | COLOR_PAIR(3));
+        mvprintw(y, mline.indent, "%s", clip(mline.text, cols - mline.indent - 2).c_str());
+        if (secondary) attroff(COLOR_PAIR(3));
+        else attroff(A_BOLD | COLOR_PAIR(3));
       }
-      if (!gk.secondary.empty() && gk.secondary != lastSecondary) {
-        attron(COLOR_PAIR(3));
-        mvprintw(y++, off + 5, "%s", clip(gk.secondary, innerW - 2).c_str());
-        attroff(COLOR_PAIR(3));
-        lastSecondary = gk.secondary;
-        if (y >= rows - 2) break;
-      }
-    } else {
-      std::string grp = dateGroupLabel(x);
-      if (!grp.empty() && grp != lastPrimary) {
-        attron(A_BOLD | COLOR_PAIR(3));
-        mvprintw(y++, off + 3, "%s", clip(grp, innerW).c_str());
-        attroff(A_BOLD | COLOR_PAIR(3));
-        lastPrimary = grp;
-        if (y >= rows - 2) break;
-      }
+      continue;
     }
-    bool selected = rowSelected(i);
-    mainRows_.push_back({y, i});
+    auto& x = list_[mline.itemIndex];
+    bool selected = rowSelected(mline.itemIndex);
+    mainRows_.push_back({y, mline.itemIndex});
     if (selected) attron(A_REVERSE);
-    int indent = off + 4;
-    if (scopeKind_ == 'p' && x.kind == 't' && x.headingId != 0) indent += 2;
     if (x.kind == 'h') {
       attron(A_BOLD);
-      mvprintw(y, off + 4, "%s", clip("\xe2\x80\x94 " + x.title, innerW - 2).c_str());
+      mvprintw(y, mline.indent, "%s", clip(mline.text, cols - mline.indent - 2).c_str());
       attroff(A_BOLD);
     } else {
-      bool graySomeday = x.someday && x.status == "open";
+      bool projSomeday = x.kind == 'p' && x.doDate == "someday";
+      bool graySomeday = (x.someday || projSomeday) && x.status == "open";
       bool dim = (x.status != "open") || graySomeday;
       if (graySomeday) attron(COLOR_PAIR(4));
       else if (dim) attron(A_DIM);
-      std::string icon = x.kind == 'p' ? "\xe2\x97\x87" : x.kind == 'a' ? "\xe2\x97\x88" : "\xe2\x97\x8b";
-      std::string mark = x.status != "open" ? "\xe2\x9c\x93 " : "";
-      mvprintw(y, indent, "%s", clip(icon + " " + mark + x.title, std::max(1, cols - indent - 23)).c_str());
+      mvprintw(y, mline.indent, "%s", clip(mline.text, std::max(1, cols - mline.indent - 23)).c_str());
       if (graySomeday) attroff(COLOR_PAIR(4));
       else if (dim) attroff(A_DIM);
-      drawIconStrip(y, cols, x);
+      if (mline.firstOfItem) drawIconStrip(y, cols, x);
     }
     if (selected) attroff(A_REVERSE);
-    ++y;
   }
   attron(A_DIM);
   mvprintw(rows - 1, off + 3, "%s", clip(visual_ ? "VISUAL -- j/k extend \xc2\xb7 x complete \xc2\xb7 m move \xc2\xb7 T tag \xc2\xb7 s/S dates \xc2\xb7 Esc exit"
@@ -262,6 +301,98 @@ void App::drawMain(int rows, int cols, int off) {
                                           std::max(0, cols - off - 5))
                                      .c_str());
   attroff(A_DIM);
+}
+
+// Builds the full virtual layout of the main list -- one MainLine per
+// physical screen line the list would occupy if the screen were infinitely
+// tall, including wrapped title/heading continuation lines and group/date
+// headers (with a blank separator line above each, per requirement #4). The
+// draw pass and the scroll-offset calculation both work off this same list,
+// so wrapping and scrolling can never disagree about where anything sits.
+std::vector<MainLine> App::buildMainLines(int cols, int off) const {
+  std::vector<MainLine> out;
+  int innerW = cols - off - 4;
+  bool twoLevel = group_ && scopeKind_ == 0;
+  std::string lastPrimary, lastSecondary;
+  bool primarySet = false;
+  auto pushHeader = [&](const std::string& text, int indent) {
+    if (!out.empty()) out.push_back({true, -1, false, indent, ""});
+    for (auto& ln : wrapText(text, std::max(1, innerW - (indent - off - 3)))) out.push_back({true, -1, false, indent, ln});
+  };
+  for (int i = 0; i < (int)list_.size(); ++i) {
+    auto& x = list_[i];
+    if (twoLevel) {
+      GroupKey gk = groupKeyFor(x);
+      if (!primarySet || gk.primary != lastPrimary) {
+        if (!gk.primary.empty()) pushHeader(gk.primary, off + 3);
+        lastPrimary = gk.primary;
+        lastSecondary.clear();
+        primarySet = true;
+      }
+      if (!gk.secondary.empty() && gk.secondary != lastSecondary) {
+        for (auto& ln : wrapText(gk.secondary, std::max(1, innerW - 2))) out.push_back({true, -1, false, off + 5, ln});
+        lastSecondary = gk.secondary;
+      }
+    } else {
+      std::string grp = dateGroupLabel(x);
+      if (!grp.empty() && grp != lastPrimary) {
+        pushHeader(grp, off + 3);
+        lastPrimary = grp;
+      }
+    }
+    int indent = off + 4;
+    if (scopeKind_ == 'p' && x.kind == 't' && x.headingId != 0) indent += 2;
+    std::string full;
+    if (x.kind == 'h') {
+      full = "\xe2\x80\x94 " + x.title;
+    } else {
+      std::string icon = x.kind == 'p' ? "\xe2\x97\x87" : x.kind == 'a' ? "\xe2\x97\x88" : "\xe2\x97\x8b";
+      std::string mark = x.status != "open" ? "\xe2\x9c\x93 " : "";
+      full = icon + " " + mark + x.title;
+    }
+    int wrapWidth = std::max(1, cols - indent - 2 - 23);
+    auto wrapped = wrapText(full, wrapWidth);
+    for (int li = 0; li < (int)wrapped.size(); ++li)
+      out.push_back({false, i, li == 0, li == 0 ? indent : indent + 2, wrapped[li]});
+  }
+  return out;
+}
+
+// Adjusts scroll_ (persistent across frames, so it only resets where the
+// interaction actually warrants it -- see the pick_/scroll_ resets in
+// handle()/openContainer()/etc.) so the selected row stays visible:
+// scrolloff-style margin correction for ordinary single-step movement, and
+// a "land roughly a third of the way down, with 3-4 rows of context below"
+// recenter when the target is a genuine jump to somewhere off-screen. Both
+// are clamped to the list's own bounds, which is what naturally keeps the
+// last couple of entries from being centered -- there's nothing below them
+// to leave room for.
+void App::updateScroll(const std::vector<MainLine>& lines, int viewH) {
+  if (list_.empty() || viewH <= 0) {
+    scroll_ = 0;
+    return;
+  }
+  int targetStart = -1;
+  for (int ln = 0; ln < (int)lines.size(); ++ln)
+    if (!lines[ln].header && lines[ln].itemIndex == pick_) {
+      targetStart = ln;
+      break;
+    }
+  if (targetStart < 0) {
+    scroll_ = 0;
+    return;
+  }
+  int totalLines = (int)lines.size();
+  int maxScroll = std::max(0, totalLines - viewH);
+  const int margin = 3;
+  if (targetStart < scroll_ || targetStart >= scroll_ + viewH) {
+    scroll_ = targetStart - std::max(0, viewH - 4);
+  } else if (targetStart - scroll_ < margin) {
+    scroll_ = targetStart - margin;
+  } else if (targetStart - scroll_ > viewH - 1 - margin) {
+    scroll_ = targetStart - (viewH - 1 - margin);
+  }
+  scroll_ = std::clamp(scroll_, 0, maxScroll);
 }
 
 // ---------------------------------------------------------------------------
@@ -297,18 +428,35 @@ void App::taskForm(std::optional<Item> e, int presetHeadingId, int insertAfterSo
       areaDefault = scopeAreaName_;
     }
   }
-  int w = 70, h = 18;
-  WINDOW* win = openDialog(h, w, t.id ? "EDIT TASK" : "NEW TASK");
-  getmaxyx(win, h, w);
+  std::string doDateDefault = t.someday ? "someday" : t.doDate;
+  // New task, no explicit date yet, and we're looking at Today/Tomorrow:
+  // assume that's the day it's meant for.
+  if (!t.id && doDateDefault.empty() && scopeKind_ == 0) {
+    if (hidden_.empty() && views_[view_] == "Today") doDateDefault = today();
+    else if (hidden_ == "Tomorrow") doDateDefault = todayPlus(1);
+  }
+  int w = 70, valueX = 15, valueW = w - valueX - 3;
+  // Height is sized from existing content when editing; for a brand-new
+  // item there's nothing to measure yet, so start with enough room for a
+  // couple of lines rather than 1 -- editArea's own vertical scrolling
+  // still takes over gracefully if it's typed past that.
+  int titleH = std::clamp((int)wrapText(t.title, valueW).size(), 2, 6);
+  int notesH = std::clamp((int)wrapText(t.notes, valueW).size(), 2, 12);
   std::vector<FormField> fields = {
-      {"Title", t.title, false, 1},          {"Description", t.notes, true, 3},
-      {"Tags", t.tags, false, 1},             {"Do date", t.someday ? "someday" : t.doDate, false, 1},
-      {"Deadline", t.deadline, false, 1},     {"Area", areaDefault, false, 1},
+      {"Title", t.title, true, titleH, true},  {"Description", t.notes, true, notesH},
+      {"Tags", t.tags, false, 1},               {"Do date", doDateDefault, false, 1},
+      {"Deadline", t.deadline, false, 1},       {"Area", areaDefault, false, 1},
       {"Project", projectDefault, false, 1},
   };
-  int startY = 3, labelX = 2, valueX = 15, valueW = w - valueX - 3;
+  int startY = 3, labelX = 2;
   int footerY = startY;
-  for (auto& f : fields) footerY += f.multiline ? std::max(2, f.height) : 1;
+  for (auto& f : fields) footerY += f.multiline ? std::max(1, f.height) : 1;
+  int scrRows, scrCols;
+  getmaxyx(stdscr, scrRows, scrCols);
+  (void)scrCols;
+  int h = std::clamp(footerY + 3, 10, std::max(10, scrRows - 2));
+  WINDOW* win = openDialog(h, w, t.id ? "EDIT TASK" : "NEW TASK");
+  getmaxyx(win, h, w);
   wattron(win, A_DIM);
   mvwprintw(win, footerY + 1, 2, "%s",
             clip("YYYY-MM-DD or 'someday'  \xc2\xb7  Tab/Enter next \xc2\xb7 Shift+Enter save \xc2\xb7 Esc cancel", w - 4)
@@ -338,18 +486,28 @@ void App::projectForm(std::optional<Item> e) {
   Item p = e.value_or(Item{});
   std::string areaDefault = p.areaName;
   if (!p.id && scopeKind_ == 'a') areaDefault = scopeName_;
-  int w = 70, h = 15;
+  int w = 70, valueX = 15, valueW = w - valueX - 3;
+  int titleH = std::clamp((int)wrapText(p.title, valueW).size(), 2, 6);
+  int notesH = std::clamp((int)wrapText(p.notes, valueW).size(), 2, 12);
+  std::vector<FormField> fields = {
+      {"Name", p.title, true, titleH, true},   {"Description", p.notes, true, notesH},
+      {"Area", areaDefault, false, 1},          {"Do date", p.doDate, false, 1},
+      {"Deadline", p.deadline, false, 1},
+  };
+  int startY = 3, labelX = 2;
+  int footerY = startY;
+  for (auto& f : fields) footerY += f.multiline ? std::max(1, f.height) : 1;
+  int scrRows, scrCols;
+  getmaxyx(stdscr, scrRows, scrCols);
+  (void)scrCols;
+  int h = std::clamp(footerY + 3, 9, std::max(9, scrRows - 2));
   WINDOW* win = openDialog(h, w, p.id ? "EDIT PROJECT" : "NEW PROJECT");
   getmaxyx(win, h, w);
-  std::vector<FormField> fields = {
-      {"Name", p.title, false, 1}, {"Description", p.notes, true, 3}, {"Area", areaDefault, false, 1},
-      {"Do date", p.doDate, false, 1}, {"Deadline", p.deadline, false, 1},
-  };
-  int startY = 3, labelX = 2, valueX = 15, valueW = w - valueX - 3;
-  int footerY = startY;
-  for (auto& f : fields) footerY += f.multiline ? std::max(2, f.height) : 1;
   wattron(win, A_DIM);
-  mvwprintw(win, footerY + 1, 2, "%s", clip("Tab/Enter next \xc2\xb7 Shift+Enter save \xc2\xb7 Esc cancel", w - 4).c_str());
+  mvwprintw(win, footerY + 1, 2, "%s",
+            clip("Do date: YYYY-MM-DD or 'someday'  \xc2\xb7  Tab/Enter next \xc2\xb7 Shift+Enter save \xc2\xb7 Esc cancel",
+                 w - 4)
+                .c_str());
   wattroff(win, A_DIM);
   wrefresh(win);
   FormResult r = runForm(win, fields, startY, labelX, valueX, valueW);
@@ -364,11 +522,13 @@ void App::projectForm(std::optional<Item> e) {
 
 void App::areaForm(std::optional<Item> e) {
   Item a = e.value_or(Item{});
-  int w = 50, h = 6;
+  int w = 50, valueX = 10, valueW = w - valueX - 3;
+  int nameH = std::clamp((int)wrapText(a.title, valueW).size(), 2, 5);
+  int h = std::clamp(nameH + 5, 6, 20);
   WINDOW* win = openDialog(h, w, a.id ? "RENAME AREA" : "NEW AREA");
   getmaxyx(win, h, w);
-  std::vector<FormField> fields = {{"Name", a.title, false, 1}};
-  FormResult r = runForm(win, fields, 3, 2, 10, w - 13);
+  std::vector<FormField> fields = {{"Name", a.title, true, nameH, true}};
+  FormResult r = runForm(win, fields, 3, 2, valueX, valueW);
   delwin(win);
   if (r == FormResult::Cancelled || trimmed(fields[0].value).empty()) return;
   if (a.id) s_.renameArea(a.id, fields[0].value);
@@ -376,11 +536,11 @@ void App::areaForm(std::optional<Item> e) {
 }
 
 void App::headingForm() {
-  int w = 48, h = 6;
+  int w = 48, valueX = 10, valueW = w - valueX - 3, h = 6;
   WINDOW* win = openDialog(h, w, "NEW HEADING");
   getmaxyx(win, h, w);
-  std::vector<FormField> fields = {{"Title", "", false, 1}};
-  FormResult r = runForm(win, fields, 3, 2, 10, w - 13);
+  std::vector<FormField> fields = {{"Title", "", true, 1, true}};
+  FormResult r = runForm(win, fields, 3, 2, valueX, valueW);
   delwin(win);
   if (r == FormResult::Cancelled || trimmed(fields[0].value).empty()) return;
   s_.addHeading(scope_, fields[0].value);
@@ -426,6 +586,7 @@ void App::lifecycle(const Item& i) {
     if (scopeKind_ == i.kind && scope_ == i.id) {
       scopeKind_ = 0;
       pick_ = 0;
+      scroll_ = 0;
     }
   }
 }
@@ -434,16 +595,33 @@ void App::checklistEditor(Item t) {
   auto items = parseChecklist(t.checklist);
   int pick = 0;
   bool dirty = false;
+  int scrRows, scrCols;
+  getmaxyx(stdscr, scrRows, scrCols);
+  (void)scrCols;
   while (true) {
-    int w = 56, h = std::clamp((int)items.size() + 6, 8, 20);
+    int w = 56;
+    int innerW = w - 6;
+    std::vector<std::vector<std::string>> wrapped(items.size());
+    int totalLines = 0;
+    for (size_t i = 0; i < items.size(); ++i) {
+      wrapped[i] = wrapText(items[i].text, innerW);
+      totalLines += (int)wrapped[i].size();
+    }
+    int h = std::clamp(totalLines + 6, 8, std::max(8, scrRows - 2));
     WINDOW* win = openDialog(h, w, "CHECKLIST: " + t.title);
     getmaxyx(win, h, w);
     int maxRows = h - 6;
-    for (int i = 0; i < (int)items.size() && i < maxRows; ++i) {
+    int y = 3;
+    for (int i = 0; i < (int)items.size() && y - 3 < maxRows; ++i) {
       bool sel = i == pick;
       if (sel) wattron(win, A_REVERSE);
-      mvwprintw(win, 3 + i, 2, "%s %s", items[i].done ? "\xe2\x98\x91" : "\xe2\x98\x90",
-                clip(items[i].text, w - 6).c_str());
+      for (int li = 0; li < (int)wrapped[i].size() && y - 3 < maxRows; ++li) {
+        if (li == 0)
+          mvwprintw(win, y, 2, "%s %s", items[i].done ? "\xe2\x98\x91" : "\xe2\x98\x90", wrapped[i][li].c_str());
+        else
+          mvwprintw(win, y, 4, "%s", wrapped[i][li].c_str());
+        ++y;
+      }
       if (sel) wattroff(win, A_REVERSE);
     }
     if (items.empty()) {
@@ -452,7 +630,8 @@ void App::checklistEditor(Item t) {
       wattroff(win, A_DIM);
     }
     wattron(win, A_DIM);
-    mvwprintw(win, h - 2, 2, "%s", clip("n add \xc2\xb7 Enter/space toggle \xc2\xb7 d delete \xc2\xb7 Esc close", w - 4).c_str());
+    mvwprintw(win, h - 2, 2, "%s",
+              clip("n add \xc2\xb7 e edit \xc2\xb7 Enter/space toggle \xc2\xb7 d delete \xc2\xb7 Esc close", w - 4).c_str());
     wattroff(win, A_DIM);
     wrefresh(win);
     KeyEvent k = readKey(win);
@@ -469,12 +648,27 @@ void App::checklistEditor(Item t) {
       items.erase(items.begin() + pick);
       pick = std::min(pick, std::max(0, (int)items.size() - 1));
       dirty = true;
+    } else if (k.type == Key::Char && k.ch == 'e' && !items.empty()) {
+      delwin(win);
+      int w2 = 52;
+      int itemH = std::clamp((int)wrapText(items[pick].text, w2 - 11).size(), 1, 6);
+      int h2 = itemH + 4;
+      WINDOW* win2 = openDialog(h2, w2, "EDIT ITEM");
+      getmaxyx(win2, h2, w2);
+      std::vector<FormField> fields = {{"Item", items[pick].text, true, itemH, true}};
+      FormResult r = runForm(win2, fields, 3, 2, 8, w2 - 11);
+      delwin(win2);
+      if (r == FormResult::Saved && !trimmed(fields[0].value).empty()) {
+        items[pick].text = fields[0].value;
+        dirty = true;
+      }
+      continue;
     } else if (k.type == Key::Char && k.ch == 'n') {
       delwin(win);
       int w2 = 52, h2 = 5;
       WINDOW* win2 = openDialog(h2, w2, "NEW ITEM");
       getmaxyx(win2, h2, w2);
-      std::vector<FormField> fields = {{"Item", "", false, 1}};
+      std::vector<FormField> fields = {{"Item", "", true, 1, true}};
       FormResult r = runForm(win2, fields, 3, 2, 8, w2 - 11);
       delwin(win2);
       if (r == FormResult::Saved && !trimmed(fields[0].value).empty()) {
@@ -495,14 +689,15 @@ void App::checklistEditor(Item t) {
 void App::help() {
   std::vector<std::string> lines = {
       "Mouse           click to select/navigate \xc2\xb7 click selected row to open",
-      "                right-click any row for its actions menu",
+      "                right-click any row for its actions menu \xc2\xb7 ctrl+click a",
+      "                link in a title/description to open it",
       "",
-      "j/k            move selection",
-      "h/l, Esc       switch list / go back",
+      "j/k, arrows    move selection",
+      "h/l, arrows    switch list / go back (also works inside a project/area)",
       "J/K            reorder (crosses into a heading)",
       "Enter          edit task \xc2\xb7 open project \xc2\xb7 rename/delete heading",
       "n              new... (task / project / area / heading)",
-      "c              edit the selected task's checklist",
+      "c              edit the selected task's checklist (e to edit an item)",
       "e              edit selected item",
       "x              complete task, or lifecycle for project/area",
       "X              lifecycle for the project/area you're inside",
@@ -512,14 +707,21 @@ void App::help() {
       "A              group by area / project",
       "v              visual mode: select a range for bulk actions",
       "u              revive (un-complete/un-cancel) in logbook/archives",
-      "d              delete permanently (logbook & archives)",
+      "d              delete the selected task, or (in logbook/archives) a",
+      "               project/area, permanently -- always asks to confirm",
       "b              toggle sidebar",
       "q              quit",
   };
-  int h = (int)lines.size() + 4, w = 58;
+  int scrRows, scrCols;
+  getmaxyx(stdscr, scrRows, scrCols);
+  int w = std::min(58, std::max(24, scrCols - 4));
+  std::vector<std::string> wrapped;
+  for (auto& l : lines)
+    for (auto& wl : wrapText(l, w - 4)) wrapped.push_back(wl);
+  int h = std::clamp((int)wrapped.size() + 4, 6, std::max(6, scrRows - 2));
   WINDOW* win = openDialog(h, w, "SHORTCUTS");
   getmaxyx(win, h, w);
-  for (int i = 0; i < (int)lines.size() && 3 + i < h - 1; ++i) mvwprintw(win, 3 + i, 2, "%s", clip(lines[i], w - 4).c_str());
+  for (int i = 0; i < (int)wrapped.size() && 3 + i < h - 1; ++i) mvwprintw(win, 3 + i, 2, "%s", clip(wrapped[i], w - 4).c_str());
   wrefresh(win);
   readKey(win);
   delwin(win);
@@ -536,6 +738,7 @@ void App::openContainer(char kind, int id, const std::string& title, const std::
   scopeAreaName_ = sub;
   hidden_.clear();
   pick_ = 0;
+  scroll_ = 0;
 }
 
 std::string App::homeViewFor(const Item& t) const {
@@ -554,6 +757,7 @@ void App::jumpToTask(const Item& t) {
     openContainer('a', t.areaId, t.areaName, "");
   } else {
     scopeKind_ = 0;
+    scroll_ = 0;
     std::string v = homeViewFor(t);
     if (v == "Tomorrow" || v == "Deadlines" || v == "Logged Projects" || v == "Archived Areas") {
       hidden_ = v;
@@ -595,11 +799,13 @@ void App::find() {
   if (c.kind == 'v') {
     scopeKind_ = 0;
     hidden_.clear();
+    scroll_ = 0;
     auto it = std::find(views_.begin(), views_.end(), c.label);
     view_ = it != views_.end() ? (int)(it - views_.begin()) : 0;
   } else if (c.kind == 'H') {
     scopeKind_ = 0;
     hidden_ = c.label;
+    scroll_ = 0;
   } else if (c.kind == 'a') {
     openContainer('a', c.raw.id, c.raw.title, "");
   } else if (c.kind == 'p') {
@@ -740,7 +946,7 @@ void App::showActionsMenuFor(const Item& x) {
     add("\xe2\x9c\x8e", "Edit...", 'e');
     add("\xe2\x86\x92", "Move to project...", 'm');
     add("\xe2\x98\x91", "Edit checklist...", 'c');
-    if (!open) add("\xf0\x9f\x97\x91", "Delete permanently", 'd');
+    add("\xf0\x9f\x97\x91", "Delete permanently", 'd');
   } else if (x.kind == 'p' || x.kind == 'a') {
     if (x.kind == 'p') add("\xe2\x86\xb5", "Open", '\n');
     add("\xe2\x9c\x8e", "Edit...", 'e');
@@ -774,8 +980,7 @@ void App::showActionsMenuFor(const Item& x) {
     case 'c': checklistEditor(x); break;
     case 'L': lifecycle(x); break;
     case 'd':
-      if (x.kind == 't') s_.erase(x);
-      else if (confirmDialog("Delete \"" + x.title + "\" permanently?")) s_.erase(x);
+      if (confirmDialog("Delete \"" + x.title + "\" permanently?")) s_.erase(x);
       break;
     case '\n': openContainer('p', x.id, x.title, x.areaName); break;
     case 'H': headingLifecycle(x); break;
@@ -787,7 +992,17 @@ void App::handleMouse() {
   if (getmouse(&ev) != OK) return;
   bool leftClick = ev.bstate & (BUTTON1_CLICKED | BUTTON1_PRESSED | BUTTON1_DOUBLE_CLICKED);
   bool rightClick = ev.bstate & (BUTTON3_CLICKED | BUTTON3_PRESSED);
+#ifdef BUTTON_CTRL
+  bool ctrlClick = leftClick && (ev.bstate & BUTTON_CTRL);
+#else
+  bool ctrlClick = false;
+#endif
   if (!leftClick && !rightClick) return;
+
+  if (ctrlClick && ev.y >= descRowRange_.first && ev.y < descRowRange_.second) {
+    openUrl(firstUrl(scopeDescription_));
+    return;
+  }
 
   for (auto& [y, target] : sidebarRows_) {
     if (ev.y != y) continue;
@@ -796,6 +1011,7 @@ void App::handleMouse() {
       scopeKind_ = 0;
       hidden_.clear();
       pick_ = 0;
+      scroll_ = 0;
     } else if (target.kind == 'a') {
       std::string areaName;
       for (auto& a : s_.areas())
@@ -822,13 +1038,19 @@ void App::handleMouse() {
 
   for (auto& [y, idx] : mainRows_) {
     if (ev.y != y) continue;
+    if (ctrlClick && idx >= 0 && idx < (int)list_.size()) {
+      std::string url = firstUrl(list_[idx].title);
+      if (url.empty()) url = firstUrl(list_[idx].notes);
+      openUrl(url);
+      return;
+    }
     if (rightClick) {
       showActionsMenu(idx);
     } else if (ev.bstate & BUTTON1_DOUBLE_CLICKED) {
       pick_ = idx;
-      handle('\n');
+      handle({Key::Enter});
     } else if (pick_ == idx) {
-      handle('\n');  // clicking the already-selected row opens/edits it
+      handle({Key::Enter});  // clicking the already-selected row opens/edits it
     } else {
       pick_ = idx;
     }
@@ -836,53 +1058,63 @@ void App::handleMouse() {
   }
 }
 
-void App::handle(int k) {
+void App::handle(KeyEvent k) {
+  auto isChar = [&](char c) { return k.type == Key::Char && k.ch == c; };
+  bool down = k.type == Key::Down || isChar('j');
+  bool up = k.type == Key::Up || isChar('k');
+  bool left = k.type == Key::Left || isChar('h');
+  bool right = k.type == Key::Right || isChar('l');
   if (visual_) {
-    if (k == 27 || k == 'v') {
+    if (k.type == Key::Escape || isChar('v')) {
       visual_ = false;
       return;
     }
-    if (k == 'j' || k == KEY_DOWN) {
+    if (down) {
       pick_ = std::min(pick_ + 1, std::max(0, (int)list_.size() - 1));
       return;
     }
-    if (k == 'k' || k == KEY_UP) {
+    if (up) {
       pick_ = std::max(0, pick_ - 1);
       return;
     }
-    if (k == 'x') { bulkComplete(); return; }
-    if (k == 'm') { bulkMove(); return; }
-    if (k == 'T') { bulkTag(); return; }
-    if (k == 's') { bulkSetDate(false); return; }
-    if (k == 'S') { bulkSetDate(true); return; }
+    if (isChar('x')) { bulkComplete(); return; }
+    if (isChar('m')) { bulkMove(); return; }
+    if (isChar('T')) { bulkTag(); return; }
+    if (isChar('s')) { bulkSetDate(false); return; }
+    if (isChar('S')) { bulkSetDate(true); return; }
     return;
   }
-  if (k == 'q') { on_ = false; return; }
-  if (k == 'j' || k == KEY_DOWN) { pick_ = std::min(pick_ + 1, std::max(0, (int)list_.size() - 1)); return; }
-  if (k == 'k' || k == KEY_UP) { pick_ = std::max(0, pick_ - 1); return; }
-  if ((k == 'h' || k == KEY_LEFT || k == 27) && scopeKind_ != 0) { scopeKind_ = 0; pick_ = 0; return; }
-  if (k == 'h' || k == KEY_LEFT) {
+  if (isChar('q')) { on_ = false; return; }
+  if (down) { pick_ = std::min(pick_ + 1, std::max(0, (int)list_.size() - 1)); return; }
+  if (up) { pick_ = std::max(0, pick_ - 1); return; }
+  // Escape is deliberately NOT wired to step back out of a project/area --
+  // it's also "cancel" inside dialogs, and having it double as "go back"
+  // here too made it too easy to pop out further than intended.
+  if (left && scopeKind_ != 0) { scopeKind_ = 0; pick_ = 0; scroll_ = 0; return; }
+  if (left) {
     view_ = (view_ + (int)views_.size() - 1) % views_.size();
     hidden_.clear();
     pick_ = 0;
+    scroll_ = 0;
     return;
   }
-  if (k == 'l' || k == KEY_RIGHT) {
+  if (right) {
     if (scopeKind_ != 0) return;
     view_ = (view_ + 1) % views_.size();
     hidden_.clear();
     pick_ = 0;
+    scroll_ = 0;
     return;
   }
-  if (k == 'J' && !list_.empty() && pick_ + 1 < (int)list_.size()) { moveItem(1); return; }
-  if (k == 'K' && !list_.empty() && pick_ > 0) { moveItem(-1); return; }
-  if (k == 'b') { sidebar_ = !sidebar_; return; }
-  if (k == 'v' && !list_.empty() && list_[pick_].kind == 't') {
+  if (isChar('J') && !list_.empty() && pick_ + 1 < (int)list_.size()) { moveItem(1); return; }
+  if (isChar('K') && !list_.empty() && pick_ > 0) { moveItem(-1); return; }
+  if (isChar('b')) { sidebar_ = !sidebar_; return; }
+  if (isChar('v') && !list_.empty() && list_[pick_].kind == 't') {
     visual_ = true;
     visualAnchor_ = pick_;
     return;
   }
-  if (k == 'n') {
+  if (isChar('n')) {
     std::vector<PickerItem> opts = {
         {"\xe2\x97\x8b", "New Task", "", 't', Item{}},
         {"\xe2\x97\x87", "New Project", "", 'p', Item{}},
@@ -911,21 +1143,21 @@ void App::handle(int k) {
     }
     return;
   }
-  if (k == 'c' && !list_.empty() && list_[pick_].kind == 't') { checklistEditor(list_[pick_]); return; }
-  if (k == 'f') { find(); return; }
-  if (k == 'm' && !list_.empty() && list_[pick_].kind == 't') {
+  if (isChar('c') && !list_.empty() && list_[pick_].kind == 't') { checklistEditor(list_[pick_]); return; }
+  if (isChar('f')) { find(); return; }
+  if (isChar('m') && !list_.empty() && list_[pick_].kind == 't') {
     int pid = pickProject("MOVE TO PROJECT");
     if (pid >= 0) s_.moveTask(list_[pick_].id, pid ? s_.projectAreaId(pid) : 0, pid);
     return;
   }
-  if (k == 'T') { tagFilterForm(); return; }
-  if (k == 'A') { group_ = !group_; return; }
-  if (k == 'x' && !list_.empty()) {
+  if (isChar('T')) { tagFilterForm(); return; }
+  if (isChar('A')) { group_ = !group_; return; }
+  if (isChar('x') && !list_.empty()) {
     if (list_[pick_].kind == 't') s_.complete(list_[pick_]);
     else if (list_[pick_].kind != 'h') lifecycle(list_[pick_]);
     return;
   }
-  if (k == 'X' && scopeKind_ != 0) {
+  if (isChar('X') && scopeKind_ != 0) {
     Item cur;
     cur.id = scope_;
     cur.kind = scopeKind_;
@@ -933,30 +1165,37 @@ void App::handle(int k) {
     lifecycle(cur);
     return;
   }
-  if (k == 'u' && !list_.empty() && (active() == "Logbook" || hidden_ == "Logged Projects" || hidden_ == "Archived Areas")) {
+  if (isChar('u') && !list_.empty() && (active() == "Logbook" || hidden_ == "Logged Projects" || hidden_ == "Archived Areas")) {
     s_.reopen(list_[pick_]);
     return;
   }
-  if (k == 'd' && !list_.empty() && (active() == "Logbook" || hidden_ == "Logged Projects" || hidden_ == "Archived Areas")) {
+  // d now deletes any task anywhere (always with a confirmation prompt);
+  // projects/areas keep the narrower archive-only behavior since they also
+  // have the fuller complete/cancel/delete flow via x/L.
+  if (isChar('d') && !list_.empty()) {
     auto& item = list_[pick_];
-    if (item.kind == 't') s_.erase(item);
-    else if (confirmDialog("Delete \"" + item.title + "\" permanently?")) s_.erase(item);
+    bool inArchiveView = active() == "Logbook" || hidden_ == "Logged Projects" || hidden_ == "Archived Areas";
+    if (item.kind == 't') {
+      if (confirmDialog("Delete \"" + item.title + "\" permanently?")) s_.erase(item);
+    } else if (inArchiveView) {
+      if (confirmDialog("Delete \"" + item.title + "\" permanently?")) s_.erase(item);
+    }
     return;
   }
-  if (k == 'e' && !list_.empty()) {
+  if (isChar('e') && !list_.empty()) {
     if (list_[pick_].kind == 't') taskForm(list_[pick_]);
     else if (list_[pick_].kind == 'p') projectForm(list_[pick_]);
     else if (list_[pick_].kind == 'a') areaForm(list_[pick_]);
     return;
   }
-  if ((k == '\n' || k == KEY_ENTER) && !list_.empty()) {
+  if (k.type == Key::Enter && !list_.empty()) {
     auto& sel = list_[pick_];
     if (sel.kind == 'p') openContainer('p', sel.id, sel.title, sel.areaName);
     else if (sel.kind == 't') taskForm(sel);
     else if (sel.kind == 'h' && scopeKind_ == 'p') headingLifecycle(sel);
     return;
   }
-  if (k == '?') { help(); return; }
+  if (isChar('?')) { help(); return; }
 }
 
 // ---------------------------------------------------------------------------
@@ -982,11 +1221,12 @@ void App::run() {
   // that don't understand this simply ignore it.
   fputs("\x1b[>1u", stdout);
   fflush(stdout);
+  std::signal(SIGCHLD, SIG_IGN);  // openUrl() forks a detached opener; never wait on it
   while (on_) {
     load();
     draw();
-    int k = getch();
-    if (k == KEY_MOUSE) handleMouse();
+    KeyEvent k = readKey(stdscr);
+    if (k.type == Key::Mouse) handleMouse();
     else handle(k);
   }
   fputs("\x1b[<1u", stdout);

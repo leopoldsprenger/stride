@@ -94,7 +94,7 @@ void GitSync::setRemote(const std::string& url) { config_.set("mirror_remote", u
 GitSync::KeySetup GitSync::ensureKey() {
   auto existing = config_.get("mirror_key");
   if (existing) return {keyFromHex(*existing), false};
-  Key k = generateKey();
+  CryptoKey k = generateKey();
   config_.set("mirror_key", keyToHex(k));
   return {k, true};
 }

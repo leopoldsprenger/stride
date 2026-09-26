@@ -136,14 +136,15 @@ std::vector<Ref> Store::areas(bool archived) {
   return refs(std::string("SELECT id,name,'' FROM areas WHERE status ") + (archived ? "!='open'" : "='open'") +
               " ORDER BY sort_order,name");
 }
-std::vector<Ref> Store::projects(bool archived) {
+std::vector<Ref> Store::projects(bool archived, bool excludeSomeday) {
   return refs(std::string("SELECT p.id,p.name,COALESCE(a.name,'') FROM projects p LEFT JOIN areas a ON a.id=p.area_id "
                            "WHERE p.status ") +
-              (archived ? "!='open'" : "='open'") + " ORDER BY p.sort_order,p.name");
+              (archived ? "!='open'" : "='open'") + (excludeSomeday ? " AND COALESCE(p.do_date,'')<>'someday'" : "") +
+              " ORDER BY p.sort_order,p.name");
 }
-std::vector<Ref> Store::projectsInArea(int areaId) {
+std::vector<Ref> Store::projectsInArea(int areaId, bool excludeSomeday) {
   return refs("SELECT id,name,'' FROM projects WHERE status='open' AND area_id=" + std::to_string(areaId) +
-              " ORDER BY sort_order,name");
+              (excludeSomeday ? " AND COALESCE(do_date,'')<>'someday'" : "") + " ORDER BY sort_order,name");
 }
 std::vector<std::string> Store::areaOrder() {
   std::vector<std::string> out;
@@ -269,10 +270,14 @@ std::vector<Item> Store::viewDeadlines(const std::string& tf) {
 
 std::vector<Item> Store::viewArea(int areaId, const std::string& tf) {
   std::vector<Item> out;
-  auto projects = read(
+  auto allProjects = read(
       "SELECT id,'p',name,description,'',0,'',0,'',0,COALESCE(do_date,''),COALESCE(deadline,''),'',0,status,'',sort_order "
       "FROM projects WHERE status='open' AND area_id=" +
       std::to_string(areaId) + " ORDER BY (do_date IS NULL),do_date,sort_order");
+  // Someday projects (do_date literally "someday", same sentinel tasks use)
+  // sort into the area's Someday section instead of its own Projects list.
+  std::vector<Item> projects, somedayProjects;
+  for (auto& p : allProjects) (p.doDate == "someday" ? somedayProjects : projects).push_back(p);
   auto undated = taskQuery(
       "t.status='open' AND t.someday=0 AND t.do_date IS NULL AND t.area_id=" + std::to_string(areaId) + " AND t.project_id IS NULL",
       "t.sort_order,t.id", tf);
@@ -285,10 +290,12 @@ std::vector<Item> Store::viewArea(int areaId, const std::string& tf) {
   for (auto& p : projects) p.section = "Projects";
   for (auto& t : undated) t.section = "Tasks";
   for (auto& t : dated) t.section = "Scheduled";
+  for (auto& p : somedayProjects) p.section = "Someday";
   for (auto& t : someday) t.section = "Someday";
   out.insert(out.end(), projects.begin(), projects.end());
   out.insert(out.end(), undated.begin(), undated.end());
   out.insert(out.end(), dated.begin(), dated.end());
+  out.insert(out.end(), somedayProjects.begin(), somedayProjects.end());
   out.insert(out.end(), someday.begin(), someday.end());
   return out;
 }

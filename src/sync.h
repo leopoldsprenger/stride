@@ -59,7 +59,7 @@ class GitSync {
   // and persists it. Idempotent and safe to call from multiple places --
   // only the first call (ever, for this device) actually generates one.
   struct KeySetup {
-    Key key;
+    CryptoKey key;
     bool justGenerated = false;
   };
   KeySetup ensureKey();

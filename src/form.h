@@ -14,7 +14,10 @@ struct FormField {
   std::string label;
   std::string value;
   bool multiline = false;
-  int height = 1;  // rows reserved for a multiline field
+  int height = 1;        // rows reserved for a multiline field
+  bool enterAdvances = false;  // multiline field that word-wraps and grows but is
+                                // conceptually single-line: Enter moves focus instead
+                                // of inserting a newline (e.g. a title)
 };
 
 enum class FormResult { Saved, Cancelled };

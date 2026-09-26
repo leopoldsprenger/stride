@@ -7,6 +7,7 @@
 KeyEvent readKey(WINDOW* win) {
   int c = wgetch(win);
   if (c == ERR) return {Key::None};
+  if (c == KEY_MOUSE) return {Key::Mouse};
   if (c == 27) {
     // Might be a standalone Escape, or the start of a multi-byte sequence
     // (arrow keys, or a CSI-u encoded key) that keypad() didn't recognize.
@@ -180,7 +181,7 @@ std::vector<WrapLine> wrapWithOffsets(const std::string& text, int width) {
 }
 }  // namespace
 
-FieldOutcome editArea(WINDOW* win, int y, int x, int width, int height, std::string& text) {
+FieldOutcome editArea(WINDOW* win, int y, int x, int width, int height, std::string& text, bool enterAdvances) {
   size_t cursor = text.size();
   int scrollLine = 0;
   while (true) {
@@ -209,6 +210,10 @@ FieldOutcome editArea(WINDOW* win, int y, int x, int width, int height, std::str
         cursor++;
         break;
       case Key::Enter:
+        if (enterAdvances) {
+          curs_set(0);
+          return FieldOutcome::Next;
+        }
         text.insert(text.begin() + cursor, '\n');
         cursor++;
         break;

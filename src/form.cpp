@@ -62,9 +62,11 @@ FormResult runForm(WINDOW* win, std::vector<FormField>& fields, int startY, int 
       }
     }
     wrefresh(win);
-    FieldOutcome outcome = fields[focus].multiline
-                                ? editArea(win, rowY[focus], valueX, valueW, fields[focus].height, fields[focus].value)
-                                : editLine(win, rowY[focus], valueX, valueW, fields[focus].value);
+    FieldOutcome outcome =
+        fields[focus].multiline
+            ? editArea(win, rowY[focus], valueX, valueW, fields[focus].height, fields[focus].value,
+                       fields[focus].enterAdvances)
+            : editLine(win, rowY[focus], valueX, valueW, fields[focus].value);
     if (outcome == FieldOutcome::Cancelled) return FormResult::Cancelled;
     if (outcome == FieldOutcome::Saved) return FormResult::Saved;
     if (outcome == FieldOutcome::Next) {

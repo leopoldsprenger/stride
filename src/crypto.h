@@ -10,13 +10,13 @@
 #include <string>
 #include <vector>
 
-using Key = std::vector<uint8_t>;
+using CryptoKey = std::vector<uint8_t>;
 
 // 32 cryptographically random bytes (AES-256 key size), from OpenSSL's RNG.
-Key generateKey();
+CryptoKey generateKey();
 
-std::string keyToHex(const Key& key);
-Key keyFromHex(const std::string& hex);  // throws if not exactly 64 hex chars
+std::string keyToHex(const CryptoKey& key);
+CryptoKey keyFromHex(const std::string& hex);  // throws if not exactly 64 hex chars
 
 // Plain SHA-256 (hex), unrelated to the key -- used only to detect "did the
 // plaintext actually change" before re-encrypting, since AES-GCM's nonce is
@@ -28,10 +28,10 @@ std::string sha256Hex(const std::string& data);
 // Layout: [4-byte magic "SKE1"][12-byte nonce][ciphertext][16-byte GCM tag].
 // A fresh random nonce is generated on every call -- never reuse a nonce
 // under the same key, so never try to make this deterministic.
-std::string encryptBlob(const Key& key, const std::string& plaintext);
+std::string encryptBlob(const CryptoKey& key, const std::string& plaintext);
 
 // Throws std::runtime_error on a bad magic/length (not our format), and on
 // GCM tag verification failure (wrong key, or the blob was tampered with) --
 // callers must not treat either as "empty content", or a corrupted or
 // maliciously-replaced remote file would silently wipe local data.
-std::string decryptBlob(const Key& key, const std::string& blob);
+std::string decryptBlob(const CryptoKey& key, const std::string& blob);

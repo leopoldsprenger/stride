@@ -4,8 +4,10 @@
 
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
+#include "input.h"
 #include "store.h"
 
 struct GroupKey {
@@ -21,6 +23,19 @@ struct SidebarTarget {
   int idOrView;
 };
 
+// One physical screen line within the main list, produced by
+// buildMainLines() -- either a (possibly wrapped) group/date heading line,
+// a blank separator above one, or one (possibly wrapped) line of an item's
+// icon+title. Kept as data so the scroll offset can be computed against the
+// full virtual layout before anything is actually drawn.
+struct MainLine {
+  bool header = false;
+  int itemIndex = -1;    // valid when !header
+  bool firstOfItem = false;
+  int indent = 0;
+  std::string text;
+};
+
 class App {
  public:
   explicit App(Store& s) : s_(s) {}
@@ -30,6 +45,7 @@ class App {
   Store& s_;
   bool on_ = true, sidebar_ = true, group_ = false, visual_ = false;
   int pick_ = 0, view_ = 0, scope_ = 0, visualAnchor_ = 0;
+  int scroll_ = 0;  // main-list scroll offset, in virtual lines (see buildMainLines)
   char scopeKind_ = 0;
   std::string scopeName_, scopeAreaName_, scopeDescription_, tags_, hidden_;
   std::vector<Item> list_;
@@ -41,6 +57,9 @@ class App {
   // handling never assumes these are stable between frames.
   std::vector<std::pair<int, SidebarTarget>> sidebarRows_;
   std::vector<std::pair<int, int>> mainRows_;  // screen row -> index into list_
+  // Screen rows occupied by the project-description header (ctrl+click link
+  // support only -- see handleMouse); {0,0} when there's no description shown.
+  std::pair<int, int> descRowRange_{0, 0};
 
   std::string active() const;
   std::string name() const;
@@ -52,9 +71,12 @@ class App {
   // rendering
   void draw();
   void drawSidebar(int rows, int width);
+  int wrapSidebarEntry(int y, int x, int width, const std::string& label, bool cur, SidebarTarget target);
   void drawMain(int rows, int cols, int off);
   void drawIconStrip(int y, int rightEdge, const Item& x);
   bool rowSelected(int index) const;
+  std::vector<MainLine> buildMainLines(int cols, int off) const;
+  void updateScroll(const std::vector<MainLine>& lines, int viewH);
 
   // lookups
   int findAreaId(const std::string& name);
@@ -93,5 +115,5 @@ class App {
   void showActionsMenu(int index);       // for a row in the main list_
   void showActionsMenuFor(const Item& x);  // the shared menu itself; also used for sidebar rows
 
-  void handle(int k);
+  void handle(KeyEvent k);
 };

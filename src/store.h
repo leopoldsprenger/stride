@@ -20,8 +20,11 @@ class Store {
 
   // -- reference lists ------------------------------------------------------
   std::vector<Ref> areas(bool archived = false);
-  std::vector<Ref> projects(bool archived = false);
-  std::vector<Ref> projectsInArea(int areaId);
+  // excludeSomeday: leave out projects whose do date is the literal
+  // sentinel "someday" (same convention tasks use) -- for sidebar listings,
+  // which hide those the way Someday tasks are hidden from other lists.
+  std::vector<Ref> projects(bool archived = false, bool excludeSomeday = false);
+  std::vector<Ref> projectsInArea(int areaId, bool excludeSomeday = false);
   std::vector<std::string> areaOrder();  // area names in sidebar order, for grouped sorting
   std::vector<std::string> allTags();
   bool projectIsOpen(int id);
