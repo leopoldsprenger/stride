@@ -59,7 +59,7 @@ Frontmatter parseFrontmatter(const std::string& text) {
 // -- task lines --------------------------------------------------------------
 
 struct ParsedTask {
-  std::string uuid, title, status = "open", doDate, deadline, notes;
+  std::string uuid, title, status = "open", doDate, deadline, notes, completedAt;
   bool someday = false;
   std::vector<std::string> tags;
   std::vector<ChecklistItem> checklist;
@@ -92,7 +92,12 @@ ParsedTask parseTaskLine(char checkbox, std::string rest) {
     if (key == "someday") t.someday = true;
     else if (key == "do") t.doDate = val;
     else if (key == "deadline") t.deadline = val;
-    // `completed:`/`cancelled:` timestamps are display-only -- Store re-stamps its own "now" on complete()/cancel().
+    // Preserve the original completion time across devices: without this,
+    // every device that reconciles an already-completed task would
+    // re-stamp completed_at to its own "now", so no two devices' renders
+    // of the same task would ever agree -- an endless ping-pong of
+    // settling commits between them, never actually settling.
+    else if (key == "completed" || key == "cancelled") t.completedAt = val;
   }
   cleaned += rest.substr(last);
   rest = cleaned;
@@ -159,13 +164,13 @@ std::vector<ParsedBlock> parseBody(const std::string& body) {
   return blocks;
 }
 
-void applyStatus(Store& store, char kind, int id, const std::string& status) {
+void applyStatus(Store& store, char kind, int id, const std::string& status, const std::string& at = "") {
   Item i;
   i.id = id;
   i.kind = kind;
-  if (status == "cancelled") store.cancel(i);
+  if (status == "cancelled") store.cancel(i, at);
   else if (status == "open") store.reopen(i);
-  else store.complete(i);  // "done"/"completed"/anything else archived
+  else store.complete(i, at);  // "done"/"completed"/anything else archived
 }
 
 void applyTask(Store& store, const ParsedTask& pt, int areaId, int projectId, int headingId, ReconcileStats& stats) {
@@ -185,7 +190,7 @@ void applyTask(Store& store, const ParsedTask& pt, int areaId, int projectId, in
   int id = store.saveTask(it, areaId, projectId);
   store.setTaskHeading(id, headingId);
   if (wasNew) store.setStrideUuid('t', id, pt.uuid);
-  applyStatus(store, 't', id, pt.status);
+  applyStatus(store, 't', id, pt.status, pt.completedAt);
   stats.tasks++;
 }
 
@@ -233,7 +238,7 @@ ReconcileStats reconcileFromMirror(Store& store, const fs::path& mirrorDir) {
       } else {
         store.renameArea(id, title);
       }
-      applyStatus(store, 'a', id, status);
+      applyStatus(store, 'a', id, status, fm.kv.count("completed_at") ? fm.kv["completed_at"] : "");
       areaIdByName[title] = id;
       stats.areas++;
       applyBlocks(store, parseBody(fm.body), id, 0, stats);  // area's own direct tasks
@@ -279,7 +284,7 @@ ReconcileStats reconcileFromMirror(Store& store, const fs::path& mirrorDir) {
       bool wasNew = it.id == 0;
       int id = store.saveProject(it, areaId);
       if (wasNew) store.setStrideUuid('p', id, uuid);
-      applyStatus(store, 'p', id, status);
+      applyStatus(store, 'p', id, status, fm.kv.count("completed_at") ? fm.kv["completed_at"] : "");
       stats.projects++;
 
       applyBlocks(store, parseBody(fm.body), areaId, id, stats);

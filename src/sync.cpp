@@ -7,9 +7,11 @@
 #include <array>
 #include <cstring>
 #include <ctime>
+#include <fstream>
 #include <sstream>
 #include <stdexcept>
 
+#include "bundle.h"
 #include "config.h"
 #include "mirror.h"
 #include "mirror_import.h"
@@ -18,6 +20,20 @@
 extern char** environ;
 
 namespace fs = std::filesystem;
+
+namespace {
+std::string readBinaryFile(const fs::path& p) {
+  std::ifstream f(p, std::ios::binary);
+  std::ostringstream o;
+  o << f.rdbuf();
+  return o.str();
+}
+void writeBinaryFile(const fs::path& p, const std::string& content) {
+  fs::create_directories(p.parent_path());
+  std::ofstream f(p, std::ios::binary | std::ios::trunc);
+  f << content;
+}
+}  // namespace
 
 // git command output always ends in '\n' (sometimes more, on errors) --
 // trimmed() in util.h only strips spaces, so a ref name or count parsed
@@ -74,6 +90,14 @@ GitSync::GitSync(fs::path dataDir, Config& config) : dataDir_(std::move(dataDir)
 std::string GitSync::configuredRemote() const { return config_.get("mirror_remote").value_or(""); }
 
 void GitSync::setRemote(const std::string& url) { config_.set("mirror_remote", url); }
+
+GitSync::KeySetup GitSync::ensureKey() {
+  auto existing = config_.get("mirror_key");
+  if (existing) return {keyFromHex(*existing), false};
+  Key k = generateKey();
+  config_.set("mirror_key", keyToHex(k));
+  return {k, true};
+}
 
 GitSync::Validation GitSync::validateRemote(const std::string& url) {
   if (url.empty()) return {false, "empty URL"};
@@ -145,9 +169,37 @@ bool GitSync::ensureCheckout() {
 SyncOutcome GitSync::sync(Store& store) {
   auto dir = mirrorDir();
   bool freshClone = ensureCheckout();
+  auto ks = ensureKey();
 
   SyncOutcome out;
+  out.keyJustGenerated = ks.justGenerated;
+  if (ks.justGenerated) out.generatedKeyHex = keyToHex(ks.key);
   ReconcileStats rstats;
+
+  // Whatever's sitting in dir/content.enc right now (after ensureCheckout's
+  // clone, or after the reset --hard below) is what we need to reconcile.
+  // Decrypt failure is fatal to this whole sync -- see the throws comment
+  // on sync() in sync.h for why silently skipping it would be dangerous.
+  auto reconcileFromEncrypted = [&] {
+    auto encPath = dir / "content.enc";
+    if (fs::exists(encPath)) {
+      std::string blob;
+      try {
+        blob = decryptBlob(ks.key, readBinaryFile(encPath));
+      } catch (const std::exception& e) {
+        throw std::runtime_error(std::string("could not read the mirror from the remote: ") + e.what());
+      }
+      auto unpacked = dataDir_ / "mirror-unpacked";
+      std::error_code ec;
+      fs::remove_all(unpacked, ec);
+      unpackToDir(blob, unpacked / "content");
+      rstats = reconcileFromMirror(store, unpacked);
+      fs::remove_all(unpacked, ec);
+    } else if (fs::exists(dir / "content")) {
+      // Backward compat: a remote written by a pre-encryption Stride.
+      rstats = reconcileFromMirror(store, dir);
+    }
+  };
 
   if (freshClone) {
     // Whatever we just cloned is content from another device (or a truly
@@ -155,7 +207,7 @@ SyncOutcome GitSync::sync(Store& store) {
     // before we ever export, or the export below would overwrite the
     // checkout with this (empty, brand-new) database's view and push that
     // over the real data.
-    rstats = reconcileFromMirror(store, dir);
+    reconcileFromEncrypted();
   } else {
     // Multi-device sync: if another machine has pushed since our last
     // sync, adopt its state wholesale (the mirror is always fully
@@ -176,14 +228,43 @@ SyncOutcome GitSync::sync(Store& store) {
           }
           if (behindCount > 0) {
             runGit({"reset", "--quiet", "--hard", "origin/" + branch}, dir);
-            rstats = reconcileFromMirror(store, dir);
+            reconcileFromEncrypted();
           }
         }
       }
     }
   }
 
-  MirrorExporter(store).exportTo(dir);
+  // Render to a scratch (non-git-tracked) staging directory, then bundle
+  // and encrypt just the content/ subtree into the single file that
+  // actually gets committed. README.md is deliberately left behind in the
+  // staging dir, not carried into the git checkout -- it's just area/
+  // project/task counts, but "just counts" is still more than GitHub
+  // should be able to see once the whole point is that it sees nothing.
+  auto staging = dataDir_ / "mirror-staging";
+  std::error_code ec;
+  fs::remove_all(staging, ec);
+  MirrorExporter(store).exportTo(staging);
+
+  fs::remove_all(dir / "content", ec);  // old plaintext tree, if this remote predates encryption
+  fs::remove(dir / "README.md", ec);
+  std::string blob = packDir(staging / "content");
+  std::string newHash = sha256Hex(blob);
+  std::string oldHash = fs::exists(dir / "content.sha256") ? rstrip(readBinaryFile(dir / "content.sha256")) : "";
+  if (newHash != oldHash) {
+    // Only re-encrypt (and thus only touch content.enc's bytes, which is
+    // what git actually diffs) when the plaintext really changed --
+    // AES-GCM's nonce is randomized per call, so re-encrypting identical
+    // content would otherwise produce different ciphertext bytes on every
+    // single sync and defeat "only commit when something changed."
+    // content.sha256 is a plain hash of the plaintext (not encrypted, but
+    // one-way and hence not itself a leak) purely so this comparison can
+    // happen without decrypting content.enc first.
+    writeBinaryFile(dir / "content.enc", encryptBlob(ks.key, blob));
+    writeBinaryFile(dir / "content.sha256", newHash + "\n");
+  }
+  fs::copy_file(staging / MirrorExporter::kMarkerFile, dir / MirrorExporter::kMarkerFile, fs::copy_options::overwrite_existing, ec);
+  fs::remove_all(staging, ec);
 
   runGit({"add", "-A"}, dir);
   auto diff = runGit({"diff", "--cached", "--quiet"}, dir);

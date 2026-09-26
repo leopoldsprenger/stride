@@ -43,6 +43,30 @@ in
       '';
     };
 
+    mirrorEncryptionKey = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      example = lib.literalExpression ''builtins.readFile config.sops.secrets.stride-mirror-key.path'';
+      description = ''
+        The 64-hex-character (32-byte) AES-256 key Stride encrypts
+        everything with before it's ever written into the git mirror --
+        titles, notes, checklists, even filenames are unreadable to GitHub
+        or wherever the remote lives without it. Every device sharing a
+        `mirrorRemote` needs the *same* key, or they can't decrypt each
+        other's syncs.
+
+        Leave as `null` to have Stride generate one itself on first sync
+        and print it once so you can copy it elsewhere by hand.
+
+        Security note: a plain Nix string literal here ends up in the
+        world-readable `/nix/store`, same as any other Nix value -- fine
+        for a single-user machine you trust, but not for a shared machine
+        or a config you might publish. Prefer reading it from a file a
+        secrets tool manages (agenix, sops-nix, etc.), as in the example
+        above, rather than writing the key directly into your config.
+      '';
+    };
+
     syncInterval = lib.mkOption {
       type = lib.types.str;
       default = "10m";
@@ -69,14 +93,24 @@ in
   config = lib.mkIf cfg.enable (lib.mkMerge [
     {
       home.packages = [ cfg.package ];
+      assertions = [
+        {
+          assertion = cfg.mirrorEncryptionKey == null || builtins.stringLength cfg.mirrorEncryptionKey == 64;
+          message = "programs.stride.mirrorEncryptionKey must be exactly 64 hex characters (a 32-byte AES-256 key)"
+            + " -- got ${toString (builtins.stringLength cfg.mirrorEncryptionKey)}.";
+        }
+      ];
     }
 
     (lib.mkIf (cfg.mirrorRemote != null) {
       # Stride reads this on startup/`--sync`; home-manager owns the file
-      # from here on, so don't hand-edit it -- change mirrorRemote instead.
+      # from here on, so don't hand-edit it -- change mirrorRemote/
+      # mirrorEncryptionKey instead.
       home.file.".local/share/stride/config".text = ''
-        # Managed by home-manager (programs.stride.mirrorRemote) -- edits here will be overwritten.
+        # Managed by home-manager (programs.stride) -- edits here will be overwritten.
         mirror_remote=${cfg.mirrorRemote}
+      '' + lib.optionalString (cfg.mirrorEncryptionKey != null) ''
+        mirror_key=${cfg.mirrorEncryptionKey}
       '';
     })
 

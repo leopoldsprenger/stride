@@ -70,8 +70,8 @@ class Store {
   void deleteHeading(int id);
   void setTaskHeading(int taskId, int headingId);
   void moveTask(int taskId, int areaId, int projectId);
-  void complete(const Item& i);
-  void cancel(const Item& i);
+  void complete(const Item& i, const std::string& at = "");  // at: explicit completed_at (reconcile only); empty = now
+  void cancel(const Item& i, const std::string& at = "");
   void reopen(const Item& i);
   void erase(const Item& i);
   void swapOrder(const Item& a, const Item& b);

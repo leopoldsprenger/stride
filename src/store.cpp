@@ -485,15 +485,30 @@ void Store::moveTask(int taskId, int areaId, int projectId) {
   sqlite3_bind_int(s, 3, taskId);
   step(s);
 }
-void Store::complete(const Item& i) {
+void Store::complete(const Item& i, const std::string& at) {
   std::string col = i.kind == 'p' ? "completed" : "done";
-  exec("UPDATE " + std::string(tableFor(i.kind)) + " SET status='" + col +
-       "',completed_at=strftime('%Y-%m-%dT%H:%M:%f','now','localtime') WHERE id=" + std::to_string(i.id));
+  auto* s = prep("UPDATE " + std::string(tableFor(i.kind)) + " SET status='" + col +
+                 "',completed_at=" + (at.empty() ? "strftime('%Y-%m-%dT%H:%M:%f','now','localtime')" : "?") +
+                 " WHERE id=?");
+  int idIdx = 1;
+  if (!at.empty()) {
+    bind(s, 1, at);
+    idIdx = 2;
+  }
+  sqlite3_bind_int(s, idIdx, i.id);
+  step(s);
 }
-void Store::cancel(const Item& i) {
-  exec("UPDATE " + std::string(tableFor(i.kind)) +
-       " SET status='cancelled',completed_at=strftime('%Y-%m-%dT%H:%M:%f','now','localtime') WHERE id=" +
-       std::to_string(i.id));
+void Store::cancel(const Item& i, const std::string& at) {
+  auto* s = prep("UPDATE " + std::string(tableFor(i.kind)) +
+                 " SET status='cancelled',completed_at=" + (at.empty() ? "strftime('%Y-%m-%dT%H:%M:%f','now','localtime')" : "?") +
+                 " WHERE id=?");
+  int idIdx = 1;
+  if (!at.empty()) {
+    bind(s, 1, at);
+    idIdx = 2;
+  }
+  sqlite3_bind_int(s, idIdx, i.id);
+  step(s);
 }
 void Store::reopen(const Item& i) {
   exec("UPDATE " + std::string(tableFor(i.kind)) + " SET status='open',completed_at=NULL WHERE id=" + std::to_string(i.id));

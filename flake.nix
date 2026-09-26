@@ -15,7 +15,7 @@
         packages.default = pkgs.callPackage ./nix/package.nix { };
 
         devShells.default = pkgs.mkShell {
-          packages = [ pkgs.cmake pkgs.ncurses pkgs.sqlite pkgs.pkg-config pkgs.git ];
+          packages = [ pkgs.cmake pkgs.ncurses pkgs.sqlite pkgs.openssl pkgs.pkg-config pkgs.git ];
         };
 
         apps.default = {

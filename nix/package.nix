@@ -7,6 +7,7 @@
 , pkg-config
 , ncurses
 , sqlite
+, openssl
 , git
 , makeWrapper
 }:
@@ -31,6 +32,7 @@ stdenv.mkDerivation {
              # default; if your channel's differs, override with
              # `ncurses.override { unicode = true; }`
     sqlite
+    openssl  # AES-256-GCM for the encrypted git mirror (src/crypto.cpp)
   ];
 
   # `stride --sync` shells out to the `git` binary by name (see src/sync.cpp)
