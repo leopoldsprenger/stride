@@ -42,7 +42,7 @@ The database lives in an OS-appropriate location: `~/Library/Application Support
 
 ### NixOS / home-manager
 
-`flake.nix` builds the package (`nix build`, or `nix run`), and `homeManagerModules.default` (`nix/home-manager-module.nix`) gives you `programs.stride` for declarative setup, including a systemd user timer for periodic sync. See the comment at the top of that file for a usage example. On other Nix setups, `nix/package.nix` is a plain `callPackage`-able derivation.
+`flake.nix` builds the package (`nix build`, or `nix run`), and `homeManagerModules.default` (`nix/home-manager-module.nix`) gives you `programs.stride` for declarative setup, including a systemd user timer for periodic sync that's installed, enabled, *and* started automatically the first time `home-manager switch` turns it on -- no extra login needed. See the comment at the top of that file for a usage example, and `enableSyncTimer`'s doc comment for the one-line NixOS system option (`users.users.<you>.linger`) that starts it at boot on a box you don't interactively log into. On other Nix setups, `nix/package.nix` is a plain `callPackage`-able derivation.
 
 ## Sync & encryption
 
@@ -57,6 +57,89 @@ Stride can mirror your data to a git remote (GitHub or otherwise) for backup and
 **Reading it.** Since the remote is opaque by design, `stride --dump <path>` renders your current data as plain, human-readable Markdown into a directory you choose -- the same layout the encrypted mirror uses internally, minus the repo marker file and the summary README, which only make sense inside the mirror itself. Handy for grepping your own tasks, or just reassuring yourself about what's actually in there.
 
 **One-time Things import.** `stride --import-things /path/to/main.sqlite` migrates a Things 3 export -- areas, projects, headings, tasks, tags, checklists, and status all map across. Matched by a stable ID embedded in each imported row, so it's safe to re-run (updates in place, never duplicates). If your Things database is in WAL mode (it usually is), bring the `.sqlite-wal`/`.sqlite-shm` files along next to it, or very recent Things changes may be missing.
+
+## Quick capture
+
+`stride --quick-capture` is a standalone three-field dialog (Title, List, Do date) that saves straight to the
+Inbox unless you type an existing area or project name into **List** -- it never starts the full app, and exits
+the instant you save or hit Escape. It's meant to be bound to a hotkey that pops a small floating terminal
+running just that, so it works even when Stride isn't open anywhere -- this is a different, smaller thing from
+`f`'s fuzzy-find/actions popup inside the running app.
+
+Wire it up with a compositor keybinding + a window rule that floats, centers, and sizes that one window. Two
+examples, using [foot](https://codeberg.org/dnkl/foot) as the terminal -- swap in kitty/ghostty/alacritty with
+`-e` / `--command` as needed:
+
+**niri** (`~/.config/niri/config.kdl`):
+
+```kdl
+binds {
+    Mod+Shift+A { spawn "foot" "--app-id=stride-quick-capture" "-e" "stride" "--quick-capture"; }
+}
+
+window-rule {
+    match app-id="^stride-quick-capture$"
+    open-floating true
+    default-column-width { fixed 640; }
+    default-window-height { fixed 220; }
+}
+```
+
+**Hyprland** (`~/.config/hypr/hyprland.conf`):
+
+```ini
+bind = SUPER SHIFT, A, exec, foot --app-id=stride-quick-capture -e stride --quick-capture
+windowrulev2 = float, class:^(stride-quick-capture)$
+windowrulev2 = size 640 220, class:^(stride-quick-capture)$
+windowrulev2 = center, class:^(stride-quick-capture)$
+```
+
+foot closes itself the instant `stride --quick-capture` exits, so the floating window disappears the moment
+you save or cancel -- nothing lingers.
+
+## Scripting (JSON, complete, quick-add)
+
+A few extra flags exist for tools that want Stride's data without a terminal -- this is what the
+[Noctalia bar widget](#bar-widget-noctalia) below is built on, and it's a fine base for a keybinding, a status
+line, or your own script.
+
+| Command | What it does |
+| --- | --- |
+| `stride --json today\|upcoming\|inbox\|logbook` | Prints that view as a JSON array of task/project objects (`id`, `kind` (`t`/`p`), `title`, `doDate`, `deadline`, `someday`, `status`, `completedAt`, `areaName`, `projectName`, `tags`, `hasNotes`, `hasChecklist`) |
+| `stride --json projects` | Every open project, as `{id, name, areaName}` |
+| `stride --json project <name-or-id>` | `{project: {...}, tasks: [...]}` for one project |
+| `stride --complete <id> [--kind t\|p]` | Marks a task (default) or project done |
+| `stride --quick-add "<title>" [--list <area-or-project>] [--date today\|YYYY-MM-DD]` | Adds a bare task; no `--list`/`--date` means the Inbox, undated |
+
+## Bar widget (Noctalia)
+
+[`integrations/noctalia-plugin/`](integrations/noctalia-plugin/) is a small [Noctalia](https://docs.noctalia.dev)
+plugin: a bar icon showing today's item count, and a click-to-open dropdown with a Today/Upcoming/Inbox/Logbook
+tab bar, a quick-add field scoped to whatever tab (or project) you're looking at, and tappable rows to check
+tasks off or drill into a folded project. It's built on the `--json`/`--complete`/`--quick-add` flags above, so
+it needs nothing from Stride except the binary being on `PATH` (already true once installed via home-manager).
+
+```sh
+noctalia msg plugins source add stride path ~/path/to/stride/integrations/noctalia-plugin
+noctalia msg plugins enable leo/stride
+```
+
+(or **Settings → Plugins → Add source** → the same path, then toggle it on). Then add the widget to a bar the
+same way as any other, e.g. in your Noctalia `config.toml`:
+
+```toml
+[widget.stride]
+type = "leo/stride:widget"
+
+[bar.default]
+end = ["tray", "stride", "clock"]  # wherever you'd like it among your existing widgets
+```
+
+Noctalia's plugin system moves fast -- this targets the current Luau-based plugin API (`plugin_api = 9`) as of
+this writing. If something doesn't load, `noctalia msg plugins list` and the shell's own log are the first
+places to look; the plugin has no settings of its own; edit `integrations/noctalia-plugin/*.luau` directly for
+anything you want to change (the icon, the polling interval, the binary name if `stride` isn't the right one on
+`PATH`).
 
 ## Source layout
 
@@ -74,7 +157,9 @@ src/crypto.*         AES-256-GCM, via OpenSSL -- everything pushed to the git mi
 src/config.*        tiny key=value config file (mirror_remote, mirror_key)
 src/sync.*          git plumbing: clone/validate/commit/push, encrypt/decrypt, reconcile
 src/things_import.* one-time migration from a Things 3 database
-src/main.cpp        entry point + --sync / --import-things / --dump
+src/quickcapture.*  standalone Inbox-prepopulated capture dialog for --quick-capture
+src/cli_json.*      --json / --complete / --quick-add, the scripting surface the bar widget uses
+src/main.cpp        entry point + --sync / --import-things / --dump / --quick-capture / --json / --complete / --quick-add
 ```
 
 ## Keyboard

@@ -86,6 +86,17 @@ in
         `stride --sync`. Only takes effect on Linux (systemd --user isn't a
         thing on Darwin); has no effect if `mirrorRemote` isn't set, since
         there'd be nothing to sync to.
+
+        Once installed, the timer is enabled the normal systemd way (its
+        `Install.WantedBy = [ "timers.target" ]`), which starts it at every
+        login without anything further from you, and this module also
+        starts it immediately on the `home-manager switch` that first turns
+        it on, so you don't need to log out and back in. On a headless or
+        server-style NixOS machine where a user might not interactively log
+        in at all, add `users.users.<you>.linger = true;` to your *system*
+        (not home-manager) config -- the declarative equivalent of
+        `loginctl enable-linger` -- so the timer starts at boot instead of
+        waiting for a session.
       '';
     };
   };
@@ -131,6 +142,15 @@ in
         };
         Install.WantedBy = [ "timers.target" ];
       };
+      # `Install.WantedBy` above is what makes systemd *enable* the timer --
+      # i.e. symlink it so it starts at every future login on its own -- and
+      # home-manager does that enabling as a normal part of activation no
+      # matter what. `startServices` is the separate question of whether
+      # *this* `home-manager switch` also starts it right now, instead of
+      # making you log out and back in first. `mkDefault` here so it only
+      # takes effect if you haven't already set your own preference
+      # elsewhere in your config.
+      systemd.user.startServices = lib.mkDefault "sd-switch";
     })
   ]);
 }

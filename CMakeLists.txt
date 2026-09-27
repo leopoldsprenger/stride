@@ -27,6 +27,8 @@ add_executable(stride
   src/things_import.cpp
   src/crypto.cpp
   src/bundle.cpp
+  src/quickcapture.cpp
+  src/cli_json.cpp
 )
 target_include_directories(stride PRIVATE ${NCURSESW_INCLUDE_DIRS} ${SQLITE3_INCLUDE_DIRS} ${OPENSSL_INCLUDE_DIRS})
 target_link_libraries(stride PRIVATE ${NCURSESW_LIBRARIES} ${SQLITE3_LIBRARIES} ${OPENSSL_LIBRARIES})

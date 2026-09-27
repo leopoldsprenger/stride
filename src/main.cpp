@@ -3,9 +3,11 @@
 #include <iostream>
 
 #include "app.h"
+#include "cli_json.h"
 #include "config.h"
 #include "crypto.h"
 #include "mirror.h"
+#include "quickcapture.h"
 #include "store.h"
 #include "sync.h"
 #include "things_import.h"
@@ -92,6 +94,63 @@ int runImportThings(const std::string& path) {
 // currently sitting in the git checkout, so it's accurate even if you
 // haven't synced recently. Skips the marker file and README.md, which
 // only make sense inside the git mirror itself.
+int runQuickCaptureCmd() {
+  auto dir = dataDir();
+  std::filesystem::create_directories(dir);
+  Store store((dir / "stride.db").string());
+  return runQuickCapture(store);
+}
+
+// `--json <view> [arg]`, `--complete <id> [--kind t|p]`, `--quick-add
+// <title> [--list <name>] [--date <date>]` -- the scriptable surface used
+// by the bar widget (and anything else that'd rather shell out than link
+// against Stride). See cli_json.h for what each view prints.
+int runJsonCmd(int argc, char** argv, int start) {
+  std::string view = start < argc ? argv[start] : "";
+  std::string arg = (start + 1 < argc) ? argv[start + 1] : "";
+  auto dir = dataDir();
+  Store store((dir / "stride.db").string());
+  return runJson(store, view, arg);
+}
+
+int runCompleteCmd(int argc, char** argv, int start) {
+  char kind = 't';
+  int id = 0;
+  bool haveId = false;
+  for (int j = start; j < argc; ++j) {
+    std::string a = argv[j];
+    if (a == "--kind" && j + 1 < argc)
+      kind = argv[++j][0];
+    else if (!haveId) {
+      id = std::atoi(a.c_str());
+      haveId = true;
+    }
+  }
+  auto dir = dataDir();
+  Store store((dir / "stride.db").string());
+  return runComplete(store, id, kind);
+}
+
+int runQuickAddCmd(int argc, char** argv, int start) {
+  std::string title, list, date;
+  bool haveTitle = false;
+  for (int j = start; j < argc; ++j) {
+    std::string a = argv[j];
+    if (a == "--list" && j + 1 < argc)
+      list = argv[++j];
+    else if (a == "--date" && j + 1 < argc)
+      date = argv[++j];
+    else if (!haveTitle) {
+      title = a;
+      haveTitle = true;
+    }
+  }
+  auto dir = dataDir();
+  std::filesystem::create_directories(dir);
+  Store store((dir / "stride.db").string());
+  return runQuickAdd(store, title, list, date);
+}
+
 int runDump(const std::string& path) {
   auto dir = dataDir();
   Store store((dir / "stride.db").string());
@@ -112,6 +171,10 @@ int main(int argc, char** argv) {
       if (std::strcmp(argv[i], "--sync") == 0) return runSync();
       if (std::strcmp(argv[i], "--import-things") == 0 && i + 1 < argc) return runImportThings(argv[i + 1]);
       if (std::strcmp(argv[i], "--dump") == 0 && i + 1 < argc) return runDump(argv[i + 1]);
+      if (std::strcmp(argv[i], "--quick-capture") == 0) return runQuickCaptureCmd();
+      if (std::strcmp(argv[i], "--json") == 0 && i + 1 < argc) return runJsonCmd(argc, argv, i + 1);
+      if (std::strcmp(argv[i], "--complete") == 0 && i + 1 < argc) return runCompleteCmd(argc, argv, i + 1);
+      if (std::strcmp(argv[i], "--quick-add") == 0 && i + 1 < argc) return runQuickAddCmd(argc, argv, i + 1);
     }
 
     auto dir = dataDir();
