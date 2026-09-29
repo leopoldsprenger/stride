@@ -30,7 +30,7 @@ int findProjectIdByName(Store& s, const std::string& name) {
 
 }  // namespace
 
-int runQuickCapture(Store& s) {
+int runQuickCaptureTui(Store& s) {
   setlocale(LC_ALL, "");
   initscr();
   cbreak();
@@ -73,13 +73,30 @@ int runQuickCapture(Store& s) {
   std::fflush(stdout);
   endwin();
 
-  if (r == FormResult::Cancelled || trimmed(fields[0].value).empty()) return 1;
+  if (r == FormResult::Cancelled) return 1;
+  return saveQuickCapture(s, fields[0].value, fields[1].value, fields[2].value);
+}
 
+int saveQuickCapture(Store& s, const std::string& title, const std::string& list, const std::string& doDate) {
+  if (trimmed(title).empty()) return 1;
   Item t;
-  t.title = fields[0].value;
-  t.doDate = fields[2].value;  // Store::saveTask turns the literal "someday" into the someday flag
-  int projectId = findProjectIdByName(s, fields[1].value);
-  int areaId = projectId ? s.projectAreaId(projectId) : findAreaIdByName(s, fields[1].value);
+  t.title = title;
+  t.doDate = doDate;  // Store::saveTask turns the literal "someday" into the someday flag
+  int projectId = findProjectIdByName(s, list);
+  int areaId = projectId ? s.projectAreaId(projectId) : findAreaIdByName(s, list);
   s.saveTask(t, areaId, projectId);
   return 0;
+}
+
+int runQuickCapture(Store& s, bool forceTui) {
+#ifdef STRIDE_HAVE_GTK4
+  if (!forceTui) {
+    int code = 1;
+    if (runQuickCaptureGtk(s, code)) return code;
+    // No display reachable (tty, ssh, ...): fall through to the terminal UI.
+  }
+#else
+  (void)forceTui;
+#endif
+  return runQuickCaptureTui(s);
 }

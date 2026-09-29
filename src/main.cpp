@@ -94,11 +94,11 @@ int runImportThings(const std::string& path) {
 // currently sitting in the git checkout, so it's accurate even if you
 // haven't synced recently. Skips the marker file and README.md, which
 // only make sense inside the git mirror itself.
-int runQuickCaptureCmd() {
+int runQuickCaptureCmd(bool forceTui) {
   auto dir = dataDir();
   std::filesystem::create_directories(dir);
   Store store((dir / "stride.db").string());
-  return runQuickCapture(store);
+  return runQuickCapture(store, forceTui);
 }
 
 // `--json <view> [arg]`, `--complete <id> [--kind t|p]`, `--quick-add
@@ -171,7 +171,16 @@ int main(int argc, char** argv) {
       if (std::strcmp(argv[i], "--sync") == 0) return runSync();
       if (std::strcmp(argv[i], "--import-things") == 0 && i + 1 < argc) return runImportThings(argv[i + 1]);
       if (std::strcmp(argv[i], "--dump") == 0 && i + 1 < argc) return runDump(argv[i + 1]);
-      if (std::strcmp(argv[i], "--quick-capture") == 0) return runQuickCaptureCmd();
+      if (std::strcmp(argv[i], "--quick-capture") == 0) {
+        // --tui may appear before or after --quick-capture; either order
+        // forces the ncurses dialog even when Stride was built with GTK4
+        // (e.g. for testing, or a keybinding meant to run inside a terminal
+        // deliberately). Without it, the GTK4 window is used when available
+        // and there's a display to show it on; see quickcapture.cpp.
+        bool forceTui = false;
+        for (int j = 1; j < argc; ++j) forceTui |= std::strcmp(argv[j], "--tui") == 0;
+        return runQuickCaptureCmd(forceTui);
+      }
       if (std::strcmp(argv[i], "--json") == 0 && i + 1 < argc) return runJsonCmd(argc, argv, i + 1);
       if (std::strcmp(argv[i], "--complete") == 0 && i + 1 < argc) return runCompleteCmd(argc, argv, i + 1);
       if (std::strcmp(argv[i], "--quick-add") == 0 && i + 1 < argc) return runQuickAddCmd(argc, argv, i + 1);

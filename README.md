@@ -6,14 +6,14 @@ Stride is a quiet, keyboard-first GTD console for people who want their next act
 
 ## Install
 
-Requirements: CMake 3.20+, a C++23 compiler, `ncursesw`, `sqlite3`, and `openssl` (for the encrypted git mirror -- see [Sync & encryption](#sync--encryption)).
+Requirements: CMake 3.20+, a C++23 compiler, `ncursesw`, `sqlite3`, and `openssl` (for the encrypted git mirror -- see [Sync & encryption](#sync--encryption)). `gtk4` is optional but picked up automatically if present: with it, `stride --quick-capture` opens a small floating GTK4 window instead of needing a dedicated floating terminal for the ncurses dialog -- see [Quick capture](#quick-capture). Pass `-DSTRIDE_NO_GTK4=ON` to `cmake` to build without it even when `gtk4` is installed.
 
 ```sh
 # macOS (Homebrew)
-brew install cmake ncurses sqlite openssl git
+brew install cmake ncurses sqlite openssl gtk4 git
 
 # Debian/Ubuntu
-sudo apt install cmake g++ libncursesw5-dev libsqlite3-dev libssl-dev pkg-config git
+sudo apt install cmake g++ libncursesw5-dev libsqlite3-dev libssl-dev libgtk-4-dev pkg-config git
 ```
 
 On macOS, Homebrew's `openssl` is keg-only, so `cmake` may need a nudge to find it:
@@ -62,19 +62,54 @@ Stride can mirror your data to a git remote (GitHub or otherwise) for backup and
 
 `stride --quick-capture` is a standalone three-field dialog (Title, List, Do date) that saves straight to the
 Inbox unless you type an existing area or project name into **List** -- it never starts the full app, and exits
-the instant you save or hit Escape. It's meant to be bound to a hotkey that pops a small floating terminal
-running just that, so it works even when Stride isn't open anywhere -- this is a different, smaller thing from
-`f`'s fuzzy-find/actions popup inside the running app.
+the instant you save or hit Escape. It's meant to be bound to a hotkey so it works even when Stride isn't open
+anywhere -- this is a different, smaller thing from `f`'s fuzzy-find/actions popup inside the running app.
 
-Wire it up with a compositor keybinding + a window rule that floats, centers, and sizes that one window. Two
-examples, using [foot](https://codeberg.org/dnkl/foot) as the terminal -- swap in kitty/ghostty/alacritty with
-`-e` / `--command` as needed:
+There are two front ends, sharing the exact same fields, keys, and save logic:
+
+* **GTK4 window** (used automatically when Stride was built with `gtk4` -- see [Install](#install) -- and a
+  display is reachable). A small, undecorated, non-resizable window that sizes itself to its own content --
+  just the three fields, nothing more -- instead of needing a whole floating terminal for a dialog that only
+  fills its middle third. Closes on save, on Escape, **and when it loses focus** (click elsewhere, Alt-Tab
+  away), so a stray click can't leave it sitting around.
+* **ncurses dialog** (the original front end; still used as a fallback with no `gtk4` at build time, no
+  display reachable, or `--tui` passed explicitly), meant to run inside a small floating terminal.
+
+Either way, wire it up with a compositor keybinding and a window rule that floats (and, for the ncurses form,
+sizes and centers) that one window.
+
+**mangowm** (`~/.config/mango/config.conf`) -- binds straight to `stride --quick-capture`, no terminal
+involved, since the GTK4 window is a normal floating app window in its own right:
+
+```
+bind=SUPER+SHIFT,T,spawn,stride --quick-capture
+windowrule=isfloating:1,appid:^stride-quick-capture$
+```
+
+`isfloating:1` is what takes it out of the tiling layout; mango centers a floating window on the focused
+monitor by default (see mango's `no_force_center` window-rule option if you'd rather it opened somewhere
+else), sizing it from the window's own requested size since the rule sets no `width`/`height` -- which for
+this window is exactly its three fields, however wide that ends up being. `appid` is matched as a regex
+against the Wayland `app_id` the GTK4 window sets on itself (`stride-quick-capture`, anchored here with
+`^...$` so nothing else can accidentally match it); on X11 the same string goes out as the window's
+`WM_CLASS` for window managers that match on that instead. Run `mango -p` (or reload the config) after
+adding this to catch typos -- mango validates window rules and reports the file/line of anything it doesn't
+recognize.
+
+If you'd rather force the ncurses dialog even on a GTK4 build (e.g. to keep everything inside one terminal
+session over SSH), bind to `stride --quick-capture --tui` instead and wire up a floating terminal the way the
+niri/Hyprland examples below do -- `--tui` works identically under mango's `windowrule`/`bind` syntax, just
+swap the command.
+
+Two examples of the ncurses-dialog-in-a-floating-terminal approach, for compositors without a GTK4 front end
+wired up (or when you've forced `--tui`), using [foot](https://codeberg.org/dnkl/foot) as the terminal --
+swap in kitty/ghostty/alacritty with `-e` / `--command` as needed:
 
 **niri** (`~/.config/niri/config.kdl`):
 
 ```kdl
 binds {
-    Mod+Shift+A { spawn "foot" "--app-id=stride-quick-capture" "-e" "stride" "--quick-capture"; }
+    Mod+Shift+A { spawn "foot" "--app-id=stride-quick-capture" "-e" "stride" "--quick-capture" "--tui"; }
 }
 
 window-rule {
@@ -88,14 +123,14 @@ window-rule {
 **Hyprland** (`~/.config/hypr/hyprland.conf`):
 
 ```ini
-bind = SUPER SHIFT, A, exec, foot --app-id=stride-quick-capture -e stride --quick-capture
+bind = SUPER SHIFT, A, exec, foot --app-id=stride-quick-capture -e stride --quick-capture --tui
 windowrulev2 = float, class:^(stride-quick-capture)$
 windowrulev2 = size 640 220, class:^(stride-quick-capture)$
 windowrulev2 = center, class:^(stride-quick-capture)$
 ```
 
-foot closes itself the instant `stride --quick-capture` exits, so the floating window disappears the moment
-you save or cancel -- nothing lingers.
+foot closes itself the instant `stride --quick-capture --tui` exits, so the floating window disappears the
+moment you save or cancel -- nothing lingers.
 
 ## Scripting (JSON, complete, quick-add)
 

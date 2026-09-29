@@ -10,6 +10,13 @@
 , openssl
 , git
 , makeWrapper
+, gtk4
+, withGtk4 ? true  # `stride --quick-capture` opens a small floating GTK4
+                    # window instead of needing a dedicated floating
+                    # terminal for the ncurses dialog -- see the "Quick
+                    # capture" section of README.md. Set to false for a
+                    # smaller closure (e.g. a headless box); --quick-capture
+                    # then always uses the ncurses dialog, same as before.
 }:
 
 stdenv.mkDerivation {
@@ -33,7 +40,9 @@ stdenv.mkDerivation {
              # `ncurses.override { unicode = true; }`
     sqlite
     openssl  # AES-256-GCM for the encrypted git mirror (src/crypto.cpp)
-  ];
+  ] ++ lib.optional withGtk4 gtk4;
+
+  cmakeFlags = lib.optional (!withGtk4) "-DSTRIDE_NO_GTK4=ON";
 
   # `stride --sync` shells out to the `git` binary by name (see src/sync.cpp)
   # rather than linking libgit2, so it needs `git` on PATH at runtime -- Nix
