@@ -5,6 +5,9 @@
 
 Store::Store(const std::string& path) {
   if (sqlite3_open(path.c_str(), &db_) != SQLITE_OK) throw std::runtime_error("cannot open database");
+  // A second process or thread (the sync timer, a GUI-triggered sync, quick capture) can hold the write lock for a
+  // moment; wait for it instead of failing the statement outright -- step() deliberately swallows errors.
+  sqlite3_busy_timeout(db_, 5000);
   exec("PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL;");
   migrate();
 }
@@ -17,6 +20,14 @@ void Store::exec(const std::string& q) {
     sqlite3_free(err);
     throw std::runtime_error(e);
   }
+}
+
+int Store::dataVersion() {
+  auto* s = prep("PRAGMA data_version");
+  int v = 0;
+  if (sqlite3_step(s) == SQLITE_ROW) v = sqlite3_column_int(s, 0);
+  sqlite3_finalize(s);
+  return v;
 }
 
 sqlite3_stmt* Store::prep(const std::string& q) {

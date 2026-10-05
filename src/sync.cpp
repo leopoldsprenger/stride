@@ -1,6 +1,8 @@
 #include "sync.h"
 
+#include <fcntl.h>
 #include <spawn.h>
+#include <sys/file.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -46,7 +48,33 @@ static std::string rstrip(std::string s) {
   return s;
 }
 
-GitResult runGit(const std::vector<std::string>& args, const fs::path& cwd) {  std::vector<std::string> full = {"git", "-C", cwd.string()};
+// One sync at a time per data directory: the periodic systemd timer and a GUI-triggered sync both share the
+// mirror checkout and its staging directory, and interleaving them would corrupt both. flock() is released by
+// the kernel if the process dies, so a crashed sync can never leave this stuck.
+namespace {
+class SyncLock {
+ public:
+  explicit SyncLock(const fs::path& dataDir) {
+    std::error_code ec;
+    fs::create_directories(dataDir, ec);
+    fd_ = ::open((dataDir / "sync.lock").c_str(), O_CREAT | O_RDWR | O_CLOEXEC, 0600);
+    held_ = fd_ >= 0 && ::flock(fd_, LOCK_EX | LOCK_NB) == 0;
+  }
+  ~SyncLock() {
+    if (fd_ >= 0) ::close(fd_);  // closing drops the flock
+  }
+  SyncLock(const SyncLock&) = delete;
+  SyncLock& operator=(const SyncLock&) = delete;
+  bool held() const { return held_; }
+
+ private:
+  int fd_ = -1;
+  bool held_ = false;
+};
+}  // namespace
+
+GitResult runGit(const std::vector<std::string>& args, const fs::path& cwd) {
+  std::vector<std::string> full = {"git", "-C", cwd.string()};
   full.insert(full.end(), args.begin(), args.end());
 
   std::vector<char*> argv;
@@ -166,12 +194,19 @@ bool GitSync::ensureCheckout() {
   return true;
 }
 
-SyncOutcome GitSync::sync(Store& store) {
+SyncOutcome GitSync::sync(Store& store, SyncMode mode) {
+  SyncOutcome out;
+  SyncLock lock(dataDir_);
+  if (!lock.held()) {
+    out.skipped = true;
+    out.message = "another sync is already running";
+    return out;
+  }
+
   auto dir = mirrorDir();
   bool freshClone = ensureCheckout();
   auto ks = ensureKey();
 
-  SyncOutcome out;
   out.keyJustGenerated = ks.justGenerated;
   if (ks.justGenerated) out.generatedKeyHex = keyToHex(ks.key);
   ReconcileStats rstats;
@@ -208,13 +243,23 @@ SyncOutcome GitSync::sync(Store& store) {
     // checkout with this (empty, brand-new) database's view and push that
     // over the real data.
     reconcileFromEncrypted();
-  } else {
+    out.pulled = rstats.areas || rstats.projects || rstats.headings || rstats.tasks;
+  } else if (mode != SyncMode::PushOnly) {
     // Multi-device sync: if another machine has pushed since our last
     // sync, adopt its state wholesale (the mirror is always fully
     // regenerated anyway, so there's nothing meaningful to merge textually
     // -- see the module comment in mirror_import.h) and reconcile it into
     // our local database before we compute our own changes on top of it.
     auto fetch = runGit({"fetch", "--quiet", "origin"}, dir);
+    if (!fetch.ok()) {
+      out.fetchFailed = true;
+      if (mode == SyncMode::PullOnly) {
+        out.message = "could not reach the remote: " + rstrip(fetch.output);
+        return out;
+      }
+      // Both: carry on and push what we have (a push to an unreachable remote fails on its own below and is
+      // retried next time), but remember we never got to look for incoming changes.
+    }
     if (fetch.ok()) {
       auto branchRes = runGit({"rev-parse", "--abbrev-ref", "HEAD"}, dir);
       std::string branch = rstrip(branchRes.output);
@@ -229,10 +274,24 @@ SyncOutcome GitSync::sync(Store& store) {
           if (behindCount > 0) {
             runGit({"reset", "--quiet", "--hard", "origin/" + branch}, dir);
             reconcileFromEncrypted();
+            out.pulled = true;
           }
         }
       }
     }
+  }
+
+  out.pulledStats = rstats;
+
+  if (mode == SyncMode::PullOnly) {
+    std::ostringstream pm;
+    if (out.pulled)
+      pm << "pulled " << rstats.areas << " area(s), " << rstats.projects << " project(s), " << rstats.headings
+         << " heading(s), " << rstats.tasks << " task(s)";
+    else
+      pm << "already up to date";
+    out.message = pm.str();
+    return out;
   }
 
   // Render to a scratch (non-git-tracked) staging directory, then bundle
@@ -274,7 +333,13 @@ SyncOutcome GitSync::sync(Store& store) {
     std::time_t t = std::time(nullptr);
     char buf[32]{};
     std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M", std::localtime(&t));
-    auto commit = runGit({"commit", "--quiet", "-m", std::string("Stride sync: ") + buf}, dir);
+    // A fresh machine (or a systemd service with no git config) may have no committer identity, which would make
+    // every sync fail at this step. Fall back to a fixed one only when git has none of its own.
+    std::vector<std::string> commitArgs;
+    if (!runGit({"config", "user.email"}, dir).ok() || !runGit({"config", "user.name"}, dir).ok())
+      commitArgs = {"-c", "user.name=Stride", "-c", "user.email=stride@localhost"};
+    commitArgs.insert(commitArgs.end(), {"commit", "--quiet", "-m", std::string("Stride sync: ") + buf});
+    auto commit = runGit(commitArgs, dir);
     if (!commit.ok()) {
       out.message = "commit failed: " + commit.output;
       return out;
@@ -297,7 +362,13 @@ SyncOutcome GitSync::sync(Store& store) {
     auto push = !hasUpstream ? runGit({"push", "--quiet", "-u", "origin", "HEAD"}, dir)
                               : runGit({"push", "--quiet"}, dir);
     out.pushed = push.ok();
-    if (!push.ok()) out.message = "push failed (will retry next sync): " + push.output;
+    if (!push.ok()) {
+      bool behind = push.output.find("rejected") != std::string::npos ||
+                    push.output.find("non-fast-forward") != std::string::npos ||
+                    push.output.find("fetch first") != std::string::npos;
+      out.pushRejected = behind;
+      out.message = behind ? "the remote has newer changes -- pull first" : "push failed (will retry next sync): " + push.output;
+    }
   }
 
   std::ostringstream summary;
@@ -308,4 +379,58 @@ SyncOutcome GitSync::sync(Store& store) {
   summary << (out.changed ? (out.pushed ? "synced" : "committed locally, push pending") : "nothing new locally");
   out.message = out.message.empty() ? summary.str() : summary.str() + " -- " + out.message;
   return out;
+}
+
+GitSync::Status GitSync::status(Store& store) {
+  Status st;
+  st.remote = configuredRemote();
+  st.configured = !st.remote.empty();
+  if (!st.configured) return st;
+
+  SyncLock lock(dataDir_);
+  if (!lock.held()) {
+    st.busy = true;
+    return st;
+  }
+
+  auto dir = mirrorDir();
+  if (!fs::exists(dir / ".git")) {
+    st.firstSync = true;
+    st.localDirty = true;
+    st.reachable = true;  // unknown until the first real sync; don't alarm
+    return st;
+  }
+
+  auto fetch = runGit({"fetch", "--quiet", "origin"}, dir);
+  st.reachable = fetch.ok();
+  if (!fetch.ok()) {
+    st.error = rstrip(fetch.output);
+  } else {
+    auto branch = rstrip(runGit({"rev-parse", "--abbrev-ref", "HEAD"}, dir).output);
+    if (!branch.empty()) {
+      auto behind = runGit({"rev-list", "--count", "HEAD..origin/" + branch}, dir);
+      if (behind.ok()) {
+        try {
+          st.behind = std::stoi(rstrip(behind.output));
+        } catch (...) {
+        }
+      }
+    }
+  }
+
+  // Dirty = the plaintext we'd export right now isn't what was last committed. Same hash comparison sync()
+  // uses to decide whether to re-encrypt, so the two always agree.
+  try {
+    auto staging = dataDir_ / "mirror-status-staging";
+    std::error_code ec;
+    fs::remove_all(staging, ec);
+    MirrorExporter(store).exportTo(staging);
+    std::string blob = packDir(staging / "content");
+    std::string oldHash = fs::exists(dir / "content.sha256") ? rstrip(readBinaryFile(dir / "content.sha256")) : "";
+    st.localDirty = sha256Hex(blob) != oldHash;
+    fs::remove_all(staging, ec);
+  } catch (const std::exception& e) {
+    if (st.error.empty()) st.error = e.what();
+  }
+  return st;
 }

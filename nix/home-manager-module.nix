@@ -8,6 +8,7 @@
 #   programs.stride = {
 #     enable = true;
 #     mirrorRemote = "git@github.com:you/stride-data.git";
+#     interface = "gui";   # one toggle: what a bare `stride` opens ("tui" is the default)
 #   };
 #
 # `mirrorRemote` must point at either an empty repo or one that already
@@ -18,6 +19,19 @@ self:
 { config, lib, pkgs, ... }:
 let
   cfg = config.programs.stride;
+  # The interface toggle and GUI look are build-time arguments of the package (they become defaults baked into its
+  # wrapper), so one package works whether this module or a plain callPackage consumes it. Only re-parameterise
+  # when something differs from the package's own defaults, so the common case stays a cache hit.
+  finalPackage =
+    if cfg.interface == "tui" && cfg.gui.theme == "auto" && cfg.gui.accent == null && !cfg.gui.decorations
+    then cfg.package
+    else cfg.package.override {
+      defaultInterface = cfg.interface;
+      guiTheme = cfg.gui.theme;
+      guiAccent = cfg.gui.accent;
+      guiDecorations = cfg.gui.decorations;
+    };
+  syncFlag = { both = "--sync"; pull = "--pull"; push = "--push"; }.${cfg.syncDirection};
 in
 {
   options.programs.stride = {
@@ -28,6 +42,41 @@ in
       default = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
       defaultText = lib.literalExpression "stride.packages.<system>.default";
       description = "The stride package to install.";
+    };
+
+    interface = lib.mkOption {
+      type = lib.types.enum [ "tui" "gui" ];
+      default = "tui";
+      example = "gui";
+      description = ''
+        Which front end a bare `stride` opens: the terminal app (`"tui"`, the default) or the GTK4 app (`"gui"`).
+        This is the whole switch -- the other one stays one command away either way (`stride --tui`,
+        `stride --gui`, or the `stride-tui` / `stride-gui` commands), the launcher entry always starts the GUI, and
+        the sync timer, quick capture and the bar widget don't care which you pick. Falls back to the TUI if the
+        package was built without GTK4 or no display is reachable.
+      '';
+    };
+
+    gui = {
+      theme = lib.mkOption {
+        type = lib.types.enum [ "auto" "light" "dark" ];
+        default = "auto";
+        description = "GUI colour scheme. `auto` follows the desktop's light/dark setting live.";
+      };
+      accent = lib.mkOption {
+        type = lib.types.nullOr (lib.types.strMatching "#[0-9a-fA-F]{6}");
+        default = null;
+        example = "#bb9af7";
+        description = "Accent colour for check marks and selection, as `#rrggbb`. `null` keeps the built-in blue.";
+      };
+      decorations = lib.mkOption {
+        type = lib.types.bool;
+        default = false;
+        description = ''
+          Whether the GUI window asks for a titlebar. Off by default: a clean undecorated window suits tiling
+          compositors, and the page header is draggable where a compositor supports it.
+        '';
+      };
     };
 
     mirrorRemote = lib.mkOption {
@@ -77,6 +126,16 @@ in
       '';
     };
 
+    syncDirection = lib.mkOption {
+      type = lib.types.enum [ "both" "pull" "push" ];
+      default = "both";
+      description = ''
+        What the periodic timer does each run: `both` (pull other devices' changes, then push yours -- the
+        default), `pull` (only bring remote changes into this machine, never push; handy on a read-mostly
+        device) or `push` (only back this machine up).
+      '';
+    };
+
     enableSyncTimer = lib.mkOption {
       type = lib.types.bool;
       default = cfg.mirrorRemote != null;
@@ -103,7 +162,7 @@ in
 
   config = lib.mkIf cfg.enable (lib.mkMerge [
     {
-      home.packages = [ cfg.package ];
+      home.packages = [ finalPackage ];
       assertions = [
         {
           assertion = cfg.mirrorEncryptionKey == null || builtins.stringLength cfg.mirrorEncryptionKey == 64;
@@ -130,7 +189,7 @@ in
         Unit.Description = "Sync Stride's data to its git mirror";
         Service = {
           Type = "oneshot";
-          ExecStart = "${cfg.package}/bin/stride --sync";
+          ExecStart = "${finalPackage}/bin/stride ${syncFlag}";
         };
       };
       systemd.user.timers.stride-sync = {

@@ -18,6 +18,11 @@ class Store {
 
   void exec(const std::string& q);
 
+  // SQLite's PRAGMA data_version: changes only when *another* connection (the CLI, quick capture, a sync in
+  // another process or thread) commits to the database -- never for this connection's own writes. Cheap enough
+  // to poll, which is how a long-lived UI notices outside changes.
+  int dataVersion();
+
   // -- reference lists ------------------------------------------------------
   std::vector<Ref> areas(bool archived = false);
   // excludeSomeday: leave out projects whose do date is the literal

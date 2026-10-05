@@ -46,14 +46,20 @@ target_link_libraries(stride PRIVATE ${NCURSESW_LIBRARIES} ${SQLITE3_LIBRARIES} 
 target_compile_options(stride PRIVATE ${NCURSESW_CFLAGS_OTHER} ${SQLITE3_CFLAGS_OTHER} ${OPENSSL_CFLAGS_OTHER} -Wall -Wextra -Wpedantic)
 
 if(GTK4_FOUND)
-  target_sources(stride PRIVATE src/quickcapture_gtk.cpp)
+  target_sources(stride PRIVATE src/quickcapture_gtk.cpp src/gui.cpp)
   target_include_directories(stride PRIVATE ${GTK4_INCLUDE_DIRS})
   target_link_libraries(stride PRIVATE ${GTK4_LIBRARIES})
   target_compile_options(stride PRIVATE ${GTK4_CFLAGS_OTHER})
   target_compile_definitions(stride PRIVATE STRIDE_HAVE_GTK4)
-  message(STATUS "stride: GTK4 found (${GTK4_VERSION}) -- --quick-capture will use a floating GTK4 window")
+  message(STATUS "stride: GTK4 found (${GTK4_VERSION}) -- --quick-capture and --gui are available")
 else()
   message(STATUS "stride: GTK4 not found -- --quick-capture will use the ncurses dialog only")
 endif()
 
 install(TARGETS stride RUNTIME DESTINATION bin)
+if(GTK4_FOUND)
+  # Launcher entry + icon for the GUI. The file names are the GTK application id, which is also the Wayland
+  # app_id the window carries -- that's how a compositor rule or a dock matches it.
+  install(FILES data/io.github.leopoldsprenger.stride.desktop DESTINATION share/applications)
+  install(FILES data/io.github.leopoldsprenger.stride.svg DESTINATION share/icons/hicolor/scalable/apps)
+endif()

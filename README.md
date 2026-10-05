@@ -1,12 +1,12 @@
 # Stride
 
-Stride is a quiet, keyboard-first GTD console for people who want their next action close at hand. Its shape borrows from Things: capture into **Inbox**, focus **Today**, plan **Upcoming**, browse **Anytime** and **Someday**, and keep completions in **Logbook**. Areas hold standalone tasks and projects; projects are richer lists with a description, dates, headings, and a lifecycle.
+Stride is a quiet, keyboard-first GTD manager for people who want their next action close at hand, as a terminal app and as a native GTK4 app that share one database. Its shape borrows from Things: capture into **Inbox**, focus **Today**, plan **Upcoming**, browse **Anytime** and **Someday**, and keep completions in **Logbook**. Areas hold standalone tasks and projects; projects are richer lists with a description, dates, headings, and a lifecycle.
 
 ![C++](https://img.shields.io/badge/C%2B%2B-23-00599C?logo=cplusplus&logoColor=white) ![SQLite](https://img.shields.io/badge/data-SQLite-003B57?logo=sqlite&logoColor=white)
 
 ## Install
 
-Requirements: CMake 3.20+, a C++23 compiler, `ncursesw`, `sqlite3`, and `openssl` (for the encrypted git mirror -- see [Sync & encryption](#sync--encryption)). `gtk4` is optional but picked up automatically if present: with it, `stride --quick-capture` opens a small floating GTK4 window instead of needing a dedicated floating terminal for the ncurses dialog -- see [Quick capture](#quick-capture). Pass `-DSTRIDE_NO_GTK4=ON` to `cmake` to build without it even when `gtk4` is installed.
+Requirements: CMake 3.20+, a C++23 compiler, `ncursesw`, `sqlite3`, and `openssl` (for the encrypted git mirror -- see [Sync & encryption](#sync--encryption)). `gtk4` is optional but picked up automatically if present: with it you get the full GTK4 app (`stride --gui`, see [The GTK4 app](#the-gtk4-app)) and `stride --quick-capture` opens a small floating window instead of needing a dedicated floating terminal for the ncurses dialog -- see [Quick capture](#quick-capture). Pass `-DSTRIDE_NO_GTK4=ON` to `cmake` to build without it even when `gtk4` is installed.
 
 ```sh
 # macOS (Homebrew)
@@ -42,7 +42,27 @@ The database lives in an OS-appropriate location: `~/Library/Application Support
 
 ### NixOS / home-manager
 
-`flake.nix` builds the package (`nix build`, or `nix run`), and `homeManagerModules.default` (`nix/home-manager-module.nix`) gives you `programs.stride` for declarative setup, including a systemd user timer for periodic sync that's installed, enabled, *and* started automatically the first time `home-manager switch` turns it on -- no extra login needed. See the comment at the top of that file for a usage example, and `enableSyncTimer`'s doc comment for the one-line NixOS system option (`users.users.<you>.linger`) that starts it at boot on a box you don't interactively log into. On other Nix setups, `nix/package.nix` is a plain `callPackage`-able derivation.
+`flake.nix` builds the package (`nix build`, `nix run`, or `nix run .#gui`), and `homeManagerModules.default` (`nix/home-manager-module.nix`) gives you `programs.stride` for declarative setup, including a systemd user timer for periodic sync that's installed, enabled, *and* started automatically the first time `home-manager switch` turns it on -- no extra login needed. See the comment at the top of that file for a usage example, and `enableSyncTimer`'s doc comment for the one-line NixOS system option (`users.users.<you>.linger`) that starts it at boot on a box you don't interactively log into. On other Nix setups, `nix/package.nix` is a plain `callPackage`-able derivation.
+
+**One toggle for TUI vs GUI.** Nothing is removed either way; this only picks what a bare `stride` opens:
+
+```nix
+programs.stride = {
+  enable = true;
+  interface = "gui";            # "tui" (default) | "gui"
+  gui.theme = "auto";           # "auto" follows the desktop live | "light" | "dark"
+  gui.accent = "#bb9af7";       # optional #rrggbb; null = built-in blue
+  gui.decorations = false;      # a clean undecorated window (default)
+  syncDirection = "both";       # what the timer does: "both" | "pull" | "push"
+};
+```
+
+`stride --tui` / `stride --gui` (and `stride-tui` / `stride-gui`) always work whatever you pick, so you can flip
+for a single session without a rebuild. If your config consumes `nix/package.nix` directly instead of the module,
+the same toggle is a package argument: `stride.override { defaultInterface = "gui"; }`. The settings are baked in
+as *defaults* (`STRIDE_INTERFACE`, `STRIDE_THEME`, `STRIDE_ACCENT`, `STRIDE_DECORATIONS`), so an environment
+variable or flag at runtime still overrides them. With no display (ssh, a tty) or a build without GTK4, `--gui`
+says so and `stride` carries on in the terminal.
 
 ## Sync & encryption
 
@@ -52,11 +72,71 @@ Stride can mirror your data to a git remote (GitHub or otherwise) for backup and
 
 **Encryption.** Everything that reaches the remote is encrypted with AES-256-GCM before it's ever written to the git checkout -- not just task content but filenames and directory structure too, which is why: the whole rendered tree is bundled into one blob and encrypted as a single opaque file (`content.enc`). GitHub (or anyone else with access to the remote) sees one binary file that changes size over time and nothing else -- no titles, no notes, no counts, no structure. The trade-off is that git diffs on the remote are meaningless ("binary file differs") -- once the goal is "GitHub can't see anything," a meaningful diff would itself be a leak. The key lives only in local config (`mirror_key` in the `config` file next to `stride.db`) and is never committed; every device that syncs to the same remote needs the same key, copied over by hand (or declared identically via home-manager, ideally sourced from a secrets tool like `sops-nix` rather than written directly into your Nix config -- see the option's doc comment). If the key is wrong, `--sync` fails loudly rather than silently discarding what it couldn't read.
 
-**Syncing.** `stride --sync` is a separate, non-interactive command meant to be run on a timer (the NixOS module sets one up automatically; on macOS, use `launchd` or `cron`) -- it exports, and if anything actually changed, commits and pushes; if another device pushed first, it pulls their changes into your local database before pushing yours. It's a no-op otherwise, so running it often is fine.
+**Syncing.** Three non-interactive commands, all safe to run often and from a timer (the NixOS module sets one up automatically; on macOS, use `launchd` or `cron`):
+
+| Command | Direction |
+| --- | --- |
+| `stride --sync` | Both: pulls other devices' changes into your local database, then commits and pushes yours. A no-op when nothing changed. |
+| `stride --pull` | Remote → local only. Fetches and reconciles; never exports, commits or pushes. |
+| `stride --push` | Local → remote only. Never pulls; if another device pushed first, the push is refused (non-zero exit, "pull first") and nothing is overwritten. |
+
+Only one sync runs at a time per data directory (a lock file), so the timer and a GUI-triggered sync can never collide -- the second one just reports that another is running. A first sync on a new device always pulls first, whichever command you used, so an empty database can never be pushed over real data. If git has no committer identity configured (a fresh machine, a bare systemd service), Stride commits as `Stride <stride@localhost>` rather than failing.
 
 **Reading it.** Since the remote is opaque by design, `stride --dump <path>` renders your current data as plain, human-readable Markdown into a directory you choose -- the same layout the encrypted mirror uses internally, minus the repo marker file and the summary README, which only make sense inside the mirror itself. Handy for grepping your own tasks, or just reassuring yourself about what's actually in there.
 
 **One-time Things import.** `stride --import-things /path/to/main.sqlite` migrates a Things 3 export -- areas, projects, headings, tasks, tags, checklists, and status all map across. Matched by a stable ID embedded in each imported row, so it's safe to re-run (updates in place, never duplicates). If your Things database is in WAL mode (it usually is), bring the `.sqlite-wal`/`.sqlite-shm` files along next to it, or very recent Things changes may be missing.
+
+## The GTK4 app
+
+`stride --gui` opens a native window over the same database as the TUI -- same lists, same projects, areas and
+headings, same sync. Both can be open at once: the window notices writes from the TUI, quick capture, the bar widget
+and background syncs within a moment and refreshes itself.
+
+It is built to be driven from the keyboard and to stay out of the way: a quiet sidebar, one column of to-dos,
+motion only where it means something. Checking a to-do off draws the check, strikes the title through, lets the row
+rest for a beat so you can see it land (or `z` it back), then folds it away and moves the cursor to the next one, so
+a run of `x` sweeps down your list. There's no confetti. New to-dos grow in with a brief highlight.
+
+| Key | Action |
+| --- | --- |
+| `j`/`k`, `↓`/`↑` | Move the selection (`g`/`G` first/last) |
+| `1`-`6` | Inbox, Today, Upcoming, Anytime, Someday, Logbook |
+| `h`/`←` | Focus the sidebar: `j`/`k` browse and open, `Enter`/`l`/`Esc` return |
+| `Esc` | Back out of a project or area |
+| `Ctrl+K`, `/` | Quick find: jump to any list, area, project or to-do, or run a command (new project/area, sync, undo...) |
+| `n` | New to-do, opened in place under the selection. Type `@list`, `#tag` and `!when` inline: `Draft abstract @Thesis #writing !fri` |
+| `Shift+N` | New heading (in a project) |
+| `Space`, `x` | Complete / reopen |
+| `z`, `Ctrl+Z` | Undo the last completion |
+| `Enter`, `e` | Edit in place; opens a project |
+| `s`, `d`, `t`, `m` | When, deadline, tags, move to list |
+| `J`/`K` | Reorder |
+| `Backspace` | Delete (asks first) |
+| `Shift+S` | Sync dialog |
+| `b`, `?`, `Ctrl+Q` | Toggle sidebar, shortcuts, quit |
+
+In the editor: `Tab`/`Shift+Tab` walk the fields (title, notes, checklist, when, deadline, tags, list), `Enter` saves
+and closes, `Ctrl+Enter` saves and starts the next to-do (so capturing a batch never leaves the keyboard), `Esc`
+saves and closes (an empty new to-do is discarded). Dates take `today`, `tomorrow`, `fri`, `+3d`, `2w`, `oct 12`,
+`2026-12-24` or `someday`, with a live preview of what was understood. The checklist field takes one item per line,
+`[x]` marking it done.
+
+**Syncing from the window.** The sync button in the footer (or `Shift+S`) opens a small dialog showing the remote and
+whether it has new changes or this device has unpushed ones (a dot on the button when either is true). It offers
+**Pull from remote**, **Push to remote** and **Sync both ways**; choosing one asks you to confirm first, then runs on a
+background thread while the icon spins -- typing and navigation never block. When a pull brings in changes, the list
+refreshes in place. If a new encryption key had to be generated, it is shown once with a Copy button.
+
+**Look.** Light and dark follow the desktop live (or force one with `STRIDE_THEME=light|dark`); `STRIDE_ACCENT=#rrggbb`
+recolours check marks and selection; `STRIDE_DECORATIONS=1` asks for a titlebar. Under NixOS these are
+`programs.stride.gui.*`.
+
+**Window rules.** The window's Wayland `app_id` (X11 `WM_CLASS`) is `io.github.leopoldsprenger.stride`, matching the
+installed launcher entry. A tiling compositor needs nothing special; to float it instead, with mangowm:
+
+```
+windowrule=isfloating:1,appid:^io\.github\.leopoldsprenger\.stride$
+```
 
 ## Quick capture
 
@@ -192,9 +272,10 @@ src/crypto.*         AES-256-GCM, via OpenSSL -- everything pushed to the git mi
 src/config.*        tiny key=value config file (mirror_remote, mirror_key)
 src/sync.*          git plumbing: clone/validate/commit/push, encrypt/decrypt, reconcile
 src/things_import.* one-time migration from a Things 3 database
+src/gui.*, gui_*.h  the GTK4 app: window + views (gui.cpp), palette/CSS (gui_theme.h), cairo icons and the check-off animation (gui_draw.h), date words (gui_dates.h)
 src/quickcapture.*  standalone Inbox-prepopulated capture dialog for --quick-capture
 src/cli_json.*      --json / --complete / --quick-add, the scripting surface the bar widget uses
-src/main.cpp        entry point + --sync / --import-things / --dump / --quick-capture / --json / --complete / --quick-add
+src/main.cpp        entry point + --gui / --tui / --sync / --pull / --push / --import-things / --dump / --quick-capture / --json / --complete / --quick-add
 ```
 
 ## Keyboard

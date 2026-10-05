@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Stride
+GenericName=To-Do Manager
+Comment=A quiet, keyboard-first to-do manager
+Exec=stride --gui
+Icon=io.github.leopoldsprenger.stride
+Terminal=false
+Categories=Office;ProjectManagement;
+Keywords=todo;tasks;gtd;things;
+StartupWMClass=io.github.leopoldsprenger.stride

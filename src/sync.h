@@ -19,6 +19,7 @@
 #include <vector>
 
 #include "crypto.h"
+#include "mirror_import.h"
 
 class Store;
 class Config;
@@ -29,9 +30,23 @@ struct GitResult {
   bool ok() const { return code == 0; }
 };
 
+// Which halves of a sync cycle to run.
+//   Both     -- pull anything the remote has that we don't, then export + commit + push (what `--sync` always did)
+//   PullOnly -- fetch and reconcile remote changes into the local database; never export, commit or push
+//   PushOnly -- export + commit + push; never fetch or reconcile (a push the remote has moved past is refused,
+//               not forced -- see SyncOutcome::pushRejected)
+// A first-ever sync on this device always pulls first regardless of mode: pushing over remote content this
+// database has never seen is exactly the data loss the mirror is designed to rule out.
+enum class SyncMode { Both, PullOnly, PushOnly };
+
 struct SyncOutcome {
   bool changed = false;      // a commit was made
   bool pushed = false;       // the push succeeded (only meaningful if changed, or if a prior commit was still unpushed)
+  bool pulled = false;       // remote changes were reconciled into the local database
+  ReconcileStats pulledStats;
+  bool pushRejected = false; // the remote has commits we don't -- pull first
+  bool fetchFailed = false;  // couldn't reach the remote to look for changes (offline, auth, ...)
+  bool skipped = false;      // another sync (e.g. the systemd timer) holds the lock; nothing was done
   bool keyJustGenerated = false;
   std::string generatedKeyHex;  // set iff keyJustGenerated -- caller must show this to the user once
   std::string message;          // human-readable summary/error for logging
@@ -78,7 +93,21 @@ class GitSync {
   // blob was corrupted/tampered with) -- deliberately: silently treating
   // that as "nothing to reconcile" risks then pushing this device's state
   // over data this device simply couldn't read.
-  SyncOutcome sync(Store& store);
+  SyncOutcome sync(Store& store, SyncMode mode = SyncMode::Both);
+
+  // Cheap read-only probe for UIs: fetches, then reports how far the remote is ahead and whether the local
+  // database has changes the remote hasn't seen. Never reconciles, commits or pushes.
+  struct Status {
+    bool configured = false;
+    std::string remote;
+    bool busy = false;        // another sync holds the lock; the rest is unknown
+    bool firstSync = false;   // no local checkout yet -- the first sync will pull everything
+    bool reachable = false;   // fetch succeeded
+    int behind = 0;           // commits on the remote we haven't pulled
+    bool localDirty = false;  // local data differs from what was last synced
+    std::string error;
+  };
+  Status status(Store& store);
 
   std::filesystem::path mirrorDir() const { return dataDir_ / "mirror"; }
 

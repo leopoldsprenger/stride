@@ -4,6 +4,7 @@
 
 #include "app.h"
 #include "cli_json.h"
+#include "gui.h"
 #include "config.h"
 #include "crypto.h"
 #include "mirror.h"
@@ -52,21 +53,41 @@ std::string promptForRemote(GitSync& sync) {
   return url;
 }
 
-int runSync() {
+// `--sync` (pull then push), `--pull` (remote -> local only), `--push` (local -> remote only). Same exit-code
+// contract for all three so timers and scripts can treat them alike.
+int runSync(SyncMode mode, const char* flag) {
   auto dir = dataDir();
   Config config((dir / "config").string());
   GitSync sync(dir, config);
   if (sync.configuredRemote().empty()) {
-    std::cerr << "stride --sync: no mirror remote configured (set mirror_remote in "
+    std::cerr << "stride " << flag << ": no mirror remote configured (set mirror_remote in "
               << (dir / "config").string() << ", or run `stride` once interactively to be prompted, "
               << "or declare it via the home-manager module on NixOS)\n";
     return 1;
   }
+  std::filesystem::create_directories(dir);
   Store store((dir / "stride.db").string());
-  auto outcome = sync.sync(store);
+  auto outcome = sync.sync(store, mode);
   if (outcome.keyJustGenerated) printGeneratedKey(outcome.generatedKeyHex);
-  std::cout << "stride --sync: " << outcome.message << '\n';
+  std::cout << "stride " << flag << ": " << outcome.message << '\n';
+  if (outcome.skipped) return 0;  // another sync is mid-flight; not an error, the next run catches up
+  if (outcome.fetchFailed && mode == SyncMode::PullOnly) return 1;
+  if (outcome.pushRejected) return 1;
   return (outcome.changed && !outcome.pushed) ? 1 : 0;  // committed-but-unpushed is worth a nonzero exit for cron/systemd logs
+}
+
+// Which front end a bare `stride` opens. Precedence: explicit --gui/--tui flag, then $STRIDE_INTERFACE
+// (the home-manager module's `programs.stride.interface` sets this in the launcher it installs), then the TUI.
+enum class Interface { Tui, Gui };
+Interface chooseInterface(int argc, char** argv) {
+  for (int i = 1; i < argc; ++i) {
+    if (std::strcmp(argv[i], "--gui") == 0) return Interface::Gui;
+    if (std::strcmp(argv[i], "--tui") == 0) return Interface::Tui;
+  }
+  if (const char* env = std::getenv("STRIDE_INTERFACE")) {
+    if (std::strcmp(env, "gui") == 0) return Interface::Gui;
+  }
+  return Interface::Tui;
 }
 
 int runImportThings(const std::string& path) {
@@ -168,7 +189,9 @@ int runDump(const std::string& path) {
 int main(int argc, char** argv) {
   try {
     for (int i = 1; i < argc; ++i) {
-      if (std::strcmp(argv[i], "--sync") == 0) return runSync();
+      if (std::strcmp(argv[i], "--sync") == 0) return runSync(SyncMode::Both, "--sync");
+      if (std::strcmp(argv[i], "--pull") == 0) return runSync(SyncMode::PullOnly, "--pull");
+      if (std::strcmp(argv[i], "--push") == 0) return runSync(SyncMode::PushOnly, "--push");
       if (std::strcmp(argv[i], "--import-things") == 0 && i + 1 < argc) return runImportThings(argv[i + 1]);
       if (std::strcmp(argv[i], "--dump") == 0 && i + 1 < argc) return runDump(argv[i + 1]);
       if (std::strcmp(argv[i], "--quick-capture") == 0) {
@@ -189,6 +212,15 @@ int main(int argc, char** argv) {
     auto dir = dataDir();
     std::filesystem::create_directories(dir);
     Store store((dir / "stride.db").string());
+
+    if (chooseInterface(argc, argv) == Interface::Gui) {
+      // The GUI never prompts on a terminal (it may not have one): a missing remote is surfaced in its sync
+      // dialog instead, and key generation is left to the first sync. If there's no display, or this build has
+      // no GTK4, it says so and we carry on into the TUI rather than failing.
+      int rc = runGui(store);
+      if (rc != kGuiUnavailable) return rc;
+      std::cerr << "stride: falling back to the terminal interface\n";
+    }
 
     Config config((dir / "config").string());
     GitSync sync(dir, config);
