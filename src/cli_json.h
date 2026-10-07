@@ -1,10 +1,9 @@
 #pragma once
 // Small scriptable surface on top of Store, for things that want Stride's
-// data without a terminal -- e.g. `stride --json today` for a bar widget's
-// dropdown, or `--complete`/`--quick-add` for its checkboxes and add-task
-// field. Deliberately just these five verbs, each doing one obvious thing;
+// data without a terminal -- e.g. `stride --json today` for a status bar or
+// script, or `--complete`/`--quick-add` for checking things off and adding tasks. Deliberately just these five verbs, each doing one obvious thing;
 // this is not meant to grow into a general query language. See the
-// "Bar widget" section of README.md for the shapes each one prints.
+// "Scripting" section of README.md for the shapes each one prints.
 #include <string>
 
 #include "store.h"

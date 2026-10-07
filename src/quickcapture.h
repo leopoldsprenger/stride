@@ -1,7 +1,7 @@
 #pragma once
 // Standalone, minimal capture dialog for `stride --quick-capture`.
 //
-// Meant to be bound to a global hotkey (or a bar widget) so it works even
+// Meant to be bound to a global hotkey  so it works even
 // when the main Stride window isn't open anywhere. It never touches App.
 //
 // Two front ends share the same save path:

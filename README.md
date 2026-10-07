@@ -50,7 +50,8 @@ The database lives in an OS-appropriate location: `~/Library/Application Support
 programs.stride = {
   enable = true;
   interface = "gui";            # "tui" (default) | "gui"
-  gui.theme = "auto";           # "auto" follows the desktop live | "light" | "dark"
+  gui.theme = "auto";           # "auto" follows the active GTK theme live | "light" | "dark"
+  gui.themeCss = null;          # optional: a GTK stylesheet to take colours from instead of the live theme
   gui.accent = "#bb9af7";       # optional #rrggbb; null = built-in blue
   gui.decorations = false;      # a clean undecorated window (default)
   syncDirection = "both";       # what the timer does: "both" | "pull" | "push"
@@ -60,7 +61,7 @@ programs.stride = {
 `stride --tui` / `stride --gui` (and `stride-tui` / `stride-gui`) always work whatever you pick, so you can flip
 for a single session without a rebuild. If your config consumes `nix/package.nix` directly instead of the module,
 the same toggle is a package argument: `stride.override { defaultInterface = "gui"; }`. The settings are baked in
-as *defaults* (`STRIDE_INTERFACE`, `STRIDE_THEME`, `STRIDE_ACCENT`, `STRIDE_DECORATIONS`), so an environment
+as *defaults* (`STRIDE_INTERFACE`, `STRIDE_THEME`, `STRIDE_THEME_CSS`, `STRIDE_ACCENT`, `STRIDE_DECORATIONS`), so an environment
 variable or flag at runtime still overrides them. With no display (ssh, a tty) or a build without GTK4, `--gui`
 says so and `stride` carries on in the terminal.
 
@@ -89,7 +90,7 @@ Only one sync runs at a time per data directory (a lock file), so the timer and 
 ## The GTK4 app
 
 `stride --gui` opens a native window over the same database as the TUI -- same lists, same projects, areas and
-headings, same sync. Both can be open at once: the window notices writes from the TUI, quick capture, the bar widget
+headings, same sync. Both can be open at once: the window notices writes from the TUI, quick capture
 and background syncs within a moment and refreshes itself.
 
 It is built to be driven from the keyboard and to stay out of the way: a quiet sidebar, one column of to-dos,
@@ -112,14 +113,32 @@ a run of `x` sweeps down your list. There's no confetti. New to-dos grow in with
 | `s`, `d`, `t`, `m` | When, deadline, tags, move to list |
 | `J`/`K` | Reorder |
 | `Backspace` | Delete (asks first) |
+| `p`, `a` | New project (in the current area), new area. The **New List** button in the sidebar does the same |
+| `Shift+E` | Edit the open project (title, markdown notes, dates, area) or rename the open area; double-clicking the title works too |
+| `Shift+A` | Group Today / Tomorrow / Anytime / Someday by area and project, in sidebar order |
+| `Shift+L` | Show / hide a project's logged to-dos |
 | `Shift+S` | Sync dialog |
 | `b`, `?`, `Ctrl+Q` | Toggle sidebar, shortcuts, quit |
 
 In the editor: `Tab`/`Shift+Tab` walk the fields (title, notes, checklist, when, deadline, tags, list), `Enter` saves
 and closes, `Ctrl+Enter` saves and starts the next to-do (so capturing a batch never leaves the keyboard), `Esc`
 saves and closes (an empty new to-do is discarded). Dates take `today`, `tomorrow`, `fri`, `+3d`, `2w`, `oct 12`,
-`2026-12-24` or `someday`, with a live preview of what was understood. The checklist field takes one item per line,
-`[x]` marking it done.
+`2026-12-24` or `someday`, with a live preview of what was understood.
+
+**Checklists** are small circles you tick, like Things: `Ctrl+L` (or the *Add checklist item* line) adds one, `Enter`
+starts the next, `Enter` or `Backspace` on an empty item removes it, `↑`/`↓` move between items.
+
+**Notes are markdown.** `* ` or `- ` at the start of a line becomes a bullet that behaves like one in a modern editor
+(`Enter` continues it, `Enter` on an empty one ends the list, `Tab`/`Shift+Tab` nest it, `Backspace` turns it back into
+text); `` `code` ``, `**bold**`, `*italic*`, `~~strike~~`, `# headings`, `> quotes`, fenced code and `[text](url)` are
+styled as you type, with the markers tucked away except on the line you're editing (`Ctrl+B` / `Ctrl+I` wrap a
+selection). URLs, e-mail addresses and phone numbers are links even when written plain -- click one to open it
+(phone numbers open your `tel:` handler, or are copied if there isn't one). The same goes for a project's description
+under its title. Notes are stored as ordinary markdown, so the TUI and the git mirror see plain text.
+
+**Logged to-dos.** A project ends with a quiet *Show N logged to-dos* line; it expands into a plain timeline, newest
+check-off first, each with the date it was checked off (Logbook, Logged Projects and Archived Areas show that date too).
+Checking one off again moves it back among the open ones.
 
 **Syncing from the window.** The sync button in the footer (or `Shift+S`) opens a small dialog showing the remote and
 whether it has new changes or this device has unpushed ones (a dot on the button when either is true). It offers
@@ -127,9 +146,14 @@ whether it has new changes or this device has unpushed ones (a dot on the button
 background thread while the icon spins -- typing and navigation never block. When a pull brings in changes, the list
 refreshes in place. If a new encryption key had to be generated, it is shown once with a Copy button.
 
-**Look.** Light and dark follow the desktop live (or force one with `STRIDE_THEME=light|dark`); `STRIDE_ACCENT=#rrggbb`
-recolours check marks and selection; `STRIDE_DECORATIONS=1` asks for a titlebar. Under NixOS these are
-`programs.stride.gui.*`.
+**Look.** Every colour -- backgrounds, text, selection, even the list icons -- is read from the GTK theme that is active
+right now (`window_bg_color`, `accent_bg_color`, `warning_color`... or the classic `theme_bg_color`,
+`theme_selected_bg_color`...; anything a theme doesn't define is derived from what it does), and the app re-colours
+live when the theme changes. To take the colours from a particular stylesheet instead, point at it with
+`STRIDE_THEME_CSS=/path/to/gtk.css` (or `theme_css=/path/to/gtk.css` in `~/.local/share/stride/config`); its
+`@define-color` lines are evaluated directly, and an edit to the file is picked up live. `STRIDE_THEME=light|dark`
+forces the built-in palettes, `STRIDE_ACCENT=#rrggbb` overrides the accent, `STRIDE_DECORATIONS=1` asks for a titlebar.
+Quick capture uses exactly the same palette. Under NixOS these are `programs.stride.gui.*`.
 
 **Window rules.** The window's Wayland `app_id` (X11 `WM_CLASS`) is `io.github.leopoldsprenger.stride`, matching the
 installed launcher entry. A tiling compositor needs nothing special; to float it instead, with mangowm:
@@ -214,9 +238,8 @@ moment you save or cancel -- nothing lingers.
 
 ## Scripting (JSON, complete, quick-add)
 
-A few extra flags exist for tools that want Stride's data without a terminal -- this is what the
-[Noctalia bar widget](#bar-widget-noctalia) below is built on, and it's a fine base for a keybinding, a status
-line, or your own script.
+A few extra flags exist for tools that want Stride's data without a terminal -- a fine base for a keybinding, a
+status line, or your own script.
 
 | Command | What it does |
 | --- | --- |
@@ -225,36 +248,6 @@ line, or your own script.
 | `stride --json project <name-or-id>` | `{project: {...}, tasks: [...]}` for one project |
 | `stride --complete <id> [--kind t\|p]` | Marks a task (default) or project done |
 | `stride --quick-add "<title>" [--list <area-or-project>] [--date today\|YYYY-MM-DD]` | Adds a bare task; no `--list`/`--date` means the Inbox, undated |
-
-## Bar widget (Noctalia)
-
-[`integrations/noctalia-plugin/`](integrations/noctalia-plugin/) is a small [Noctalia](https://docs.noctalia.dev)
-plugin: a bar icon showing today's item count, and a click-to-open dropdown with a Today/Upcoming/Inbox/Logbook
-tab bar, a quick-add field scoped to whatever tab (or project) you're looking at, and tappable rows to check
-tasks off or drill into a folded project. It's built on the `--json`/`--complete`/`--quick-add` flags above, so
-it needs nothing from Stride except the binary being on `PATH` (already true once installed via home-manager).
-
-```sh
-noctalia msg plugins source add stride path ~/path/to/stride/integrations/noctalia-plugin
-noctalia msg plugins enable leo/stride
-```
-
-(or **Settings → Plugins → Add source** → the same path, then toggle it on). Then add the widget to a bar the
-same way as any other, e.g. in your Noctalia `config.toml`:
-
-```toml
-[widget.stride]
-type = "leo/stride:widget"
-
-[bar.default]
-end = ["tray", "stride", "clock"]  # wherever you'd like it among your existing widgets
-```
-
-Noctalia's plugin system moves fast -- this targets the current Luau-based plugin API (`plugin_api = 9`) as of
-this writing. If something doesn't load, `noctalia msg plugins list` and the shell's own log are the first
-places to look; the plugin has no settings of its own; edit `integrations/noctalia-plugin/*.luau` directly for
-anything you want to change (the icon, the polling interval, the binary name if `stride` isn't the right one on
-`PATH`).
 
 ## Source layout
 
@@ -272,9 +265,9 @@ src/crypto.*         AES-256-GCM, via OpenSSL -- everything pushed to the git mi
 src/config.*        tiny key=value config file (mirror_remote, mirror_key)
 src/sync.*          git plumbing: clone/validate/commit/push, encrypt/decrypt, reconcile
 src/things_import.* one-time migration from a Things 3 database
-src/gui.*, gui_*.h  the GTK4 app: window + views (gui.cpp), palette/CSS (gui_theme.h), cairo icons and the check-off animation (gui_draw.h), date words (gui_dates.h)
+src/gui.*, gui_*.h  the GTK4 app: window + views (gui.cpp), palette/CSS from the GTK theme (gui_theme.h), markdown notes (gui_md.h), cairo icons and the check-off animation (gui_draw.h), date words (gui_dates.h)
 src/quickcapture.*  standalone Inbox-prepopulated capture dialog for --quick-capture
-src/cli_json.*      --json / --complete / --quick-add, the scripting surface the bar widget uses
+src/cli_json.*      --json / --complete / --quick-add, the scripting surface
 src/main.cpp        entry point + --gui / --tui / --sync / --pull / --push / --import-things / --dump / --quick-capture / --json / --complete / --quick-add
 ```
 

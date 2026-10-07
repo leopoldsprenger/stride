@@ -23,11 +23,12 @@ let
   # wrapper), so one package works whether this module or a plain callPackage consumes it. Only re-parameterise
   # when something differs from the package's own defaults, so the common case stays a cache hit.
   finalPackage =
-    if cfg.interface == "tui" && cfg.gui.theme == "auto" && cfg.gui.accent == null && !cfg.gui.decorations
+    if cfg.interface == "tui" && cfg.gui.theme == "auto" && cfg.gui.themeCss == null && cfg.gui.accent == null && !cfg.gui.decorations
     then cfg.package
     else cfg.package.override {
       defaultInterface = cfg.interface;
       guiTheme = cfg.gui.theme;
+      guiThemeCss = cfg.gui.themeCss;
       guiAccent = cfg.gui.accent;
       guiDecorations = cfg.gui.decorations;
     };
@@ -52,7 +53,7 @@ in
         Which front end a bare `stride` opens: the terminal app (`"tui"`, the default) or the GTK4 app (`"gui"`).
         This is the whole switch -- the other one stays one command away either way (`stride --tui`,
         `stride --gui`, or the `stride-tui` / `stride-gui` commands), the launcher entry always starts the GUI, and
-        the sync timer, quick capture and the bar widget don't care which you pick. Falls back to the TUI if the
+        the sync timer, quick capture and the scripting flags don't care which you pick. Falls back to the TUI if the
         package was built without GTK4 or no display is reachable.
       '';
     };
@@ -61,7 +62,19 @@ in
       theme = lib.mkOption {
         type = lib.types.enum [ "auto" "light" "dark" ];
         default = "auto";
-        description = "GUI colour scheme. `auto` follows the desktop's light/dark setting live.";
+        description = ''
+          GUI colours. `auto` takes every colour (background, text, accent, even the list icons) from the GTK theme
+          that is active right now, and follows it live when it changes. `light` / `dark` force the built-in palettes.
+        '';
+      };
+      themeCss = lib.mkOption {
+        type = lib.types.nullOr (lib.types.either lib.types.path lib.types.str);
+        default = null;
+        example = "/home/me/.config/gtk-4.0/gtk.css";
+        description = ''
+          Optional path to a GTK stylesheet whose `@define-color` lines supply the colours, for themes that GTK
+          itself doesn't expose. `null` (the default) reads the active GTK theme directly.
+        '';
       };
       accent = lib.mkOption {
         type = lib.types.nullOr (lib.types.strMatching "#[0-9a-fA-F]{6}");

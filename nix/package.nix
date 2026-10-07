@@ -28,7 +28,8 @@
                    # TUI, and --quick-capture always uses the ncurses dialog, same as before.
 , defaultInterface ? "tui"  # What a bare `stride` opens: "tui" (the ncurses app, unchanged) or "gui" (GTK4).
                             # `stride --tui` / `stride --gui` (and `stride-tui` / `stride-gui`) always work.
-, guiTheme ? "auto"         # "auto" follows the desktop's light/dark setting; "light" / "dark" force it.
+, guiTheme ? "auto"         # "auto" takes every colour from the active GTK theme, live; "light" / "dark" force the built-in palettes.
+, guiThemeCss ? null       # Path to a GTK stylesheet (@define-color lines) to take colours from instead of the live theme.
 , guiAccent ? null          # A hex colour like "#5b9cff" for check marks and selection; null = built-in blue.
 , guiDecorations ? false    # true = a titlebar from the compositor/GTK; false = a clean undecorated window.
 }:
@@ -78,6 +79,7 @@ stdenv.mkDerivation {
       --set-default STRIDE_INTERFACE ${if withGtk4 then defaultInterface else "tui"}
       --set-default STRIDE_THEME ${guiTheme}
       --set-default STRIDE_DECORATIONS ${if guiDecorations then "1" else "0"}
+      ${lib.optionalString (guiThemeCss != null) "--set-default STRIDE_THEME_CSS ${lib.escapeShellArg (toString guiThemeCss)}"}
       ${lib.optionalString (guiAccent != null) "--set-default STRIDE_ACCENT ${lib.escapeShellArg guiAccent}"}
     )
   '';

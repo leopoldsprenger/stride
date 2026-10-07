@@ -142,7 +142,7 @@ inline void icon(cairo_t* cr, Icon ic, double size, Rgba c, double param = 0) {
     case Icon::Logbook: {  // filled rounded tile with a check
       roundRect(cr, 3.4, 2.8, 13.2, 14.4, 2.8);
       cairo_fill(cr);
-      cairo_set_source_rgba(cr, 1, 1, 1, 0.96);
+      setSource(cr, colorx::onColor(c), 0.96);
       cairo_set_line_width(cr, 1.9);
       cairo_move_to(cr, 7, 10.2);
       cairo_line_to(cr, 9.2, 12.4);
@@ -293,6 +293,7 @@ constexpr double kReopenMs = 260;
 
 struct CheckPose {
   double scale = 1, fill = 0, stroke = 0, pulse = -1;  // pulse: 0..1 progress, <0 = none
+  bool muted = false;  // a settled, finished box is drawn in grey rather than the accent
 };
 
 inline CheckPose checkPose(bool done, double tMs, bool animating, bool toDone) {
@@ -319,30 +320,46 @@ inline CheckPose checkPose(bool done, double tMs, bool animating, bool toDone) {
   return p;
 }
 
-inline void checkbox(cairo_t* cr, double w, double h, const CheckPose& p, bool hot, bool project) {
+// To-dos are rounded squares; projects (and checklist items) are circles, so the kind of a row reads at a glance.
+enum class Shape { Square, Circle };
+
+// `pie` (projects only, 0..1): the share of the project that is already done, drawn as a wedge inside the ring.
+inline void checkbox(cairo_t* cr, double w, double h, const CheckPose& p, bool hot, Shape shape, double pie = -1) {
   double cx = w / 2, cy = h / 2, R = 8.2;
+  const double corner = 4.9;
+  bool sq = shape == Shape::Square;
+  auto outline = [&](double r) {
+    if (sq) roundRect(cr, -r, -r, 2 * r, 2 * r, std::min(corner, r));
+    else cairo_arc(cr, 0, 0, r, 0, 2 * M_PI);
+  };
   cairo_save(cr);
   cairo_translate(cr, cx, cy);
   cairo_scale(cr, p.scale, p.scale);
 
+  Rgba acc = p.muted ? gPal.fg3 : gPal.accent;
   Rgba ring = hot ? gPal.accent : gPal.fg3;
-  ring = Rgba{ease::lerp(ring.r, gPal.accent.r, p.fill), ease::lerp(ring.g, gPal.accent.g, p.fill),
-              ease::lerp(ring.b, gPal.accent.b, p.fill), 1};
-  if (project) {  // a project's box is a squircle, so it's never mistaken for a task
-    cairo_set_line_width(cr, 1.6);
-    roundRect(cr, -R, -R, 2 * R, 2 * R, 5.2);
-  } else {
-    cairo_set_line_width(cr, 1.6);
-    cairo_arc(cr, 0, 0, R, 0, 2 * M_PI);
-  }
+  ring = Rgba{ease::lerp(ring.r, acc.r, p.fill), ease::lerp(ring.g, acc.g, p.fill), ease::lerp(ring.b, acc.b, p.fill), 1};
+  cairo_set_line_width(cr, 1.6);
+  outline(R - 0.8);
   setSource(cr, ring);
   cairo_stroke(cr);
 
+  if (!sq && pie > 0.001 && p.fill < 0.999) {  // progress pie, inset from the ring
+    double f = ease::clamp01(pie);
+    setSource(cr, gPal.accent, 0.78 * (1 - p.fill));
+    if (f >= 0.999) {
+      cairo_arc(cr, 0, 0, R - 3.4, 0, 2 * M_PI);
+    } else {
+      cairo_move_to(cr, 0, 0);
+      cairo_arc(cr, 0, 0, R - 3.4, -M_PI / 2, -M_PI / 2 + f * 2 * M_PI);
+      cairo_close_path(cr);
+    }
+    cairo_fill(cr);
+  }
+
   if (p.fill > 0.001) {  // fill grows from the centre
-    double fr = (R + 0.4) * p.fill;
-    setSource(cr, gPal.accent);
-    if (project) roundRect(cr, -fr, -fr, 2 * fr, 2 * fr, std::min(5.2, fr));
-    else cairo_arc(cr, 0, 0, fr, 0, 2 * M_PI);
+    outline((R - 0.4) * p.fill);
+    setSource(cr, acc);
     cairo_fill(cr);
   }
   if (p.stroke > 0.001) {  // check mark, stroked progressively along its two segments
@@ -352,7 +369,7 @@ inline void checkbox(cairo_t* cr, double w, double h, const CheckPose& p, bool h
     cairo_set_line_width(cr, 2.0);
     cairo_set_line_cap(cr, CAIRO_LINE_CAP_ROUND);
     cairo_set_line_join(cr, CAIRO_LINE_JOIN_ROUND);
-    setSource(cr, gPal.onAccent);
+    setSource(cr, p.muted ? colorx::onColor(acc) : gPal.onAccent);
     cairo_move_to(cr, ax, ay);
     if (d <= l1) {
       cairo_line_to(cr, ax + (bx - ax) * d / l1, ay + (by - ay) * d / l1);
@@ -371,11 +388,41 @@ inline void checkbox(cairo_t* cr, double w, double h, const CheckPose& p, bool h
     cairo_translate(cr, cx, cy);
     cairo_set_line_width(cr, ease::lerp(2.2, 0.6, u));
     setSource(cr, gPal.accent, 0.42 * (1 - p.pulse));
-    if (project) roundRect(cr, -(R + 1 + 6 * u), -(R + 1 + 6 * u), 2 * (R + 1 + 6 * u), 2 * (R + 1 + 6 * u), 5.2 + 6 * u);
-    else cairo_arc(cr, 0, 0, R + 1 + 6 * u, 0, 2 * M_PI);
+    outline(R + 0.2 + 6 * u);
     cairo_stroke(cr);
     cairo_restore(cr);
   }
+}
+
+// A checklist item's circle: smaller and lighter than a to-do's box. `fill` (0..1) animates the tick.
+inline void checklistCircle(cairo_t* cr, double w, double h, double fill, bool hot) {
+  double cx = w / 2, cy = h / 2, R = 6.4;
+  cairo_save(cr);
+  cairo_translate(cr, cx, cy);
+  Rgba ring = hot ? gPal.accent : gPal.fg3;
+  ring = Rgba{ease::lerp(ring.r, gPal.accent.r, fill), ease::lerp(ring.g, gPal.accent.g, fill),
+              ease::lerp(ring.b, gPal.accent.b, fill), 1};
+  cairo_set_line_width(cr, 1.4);
+  cairo_arc(cr, 0, 0, R - 0.7, 0, 2 * M_PI);
+  setSource(cr, ring);
+  cairo_stroke(cr);
+  if (fill > 0.001) {
+    cairo_arc(cr, 0, 0, (R - 0.3) * fill, 0, 2 * M_PI);
+    setSource(cr, gPal.accent);
+    cairo_fill(cr);
+    double k = ease::clamp01((fill - 0.35) / 0.65);
+    if (k > 0) {
+      cairo_set_line_width(cr, 1.6);
+      cairo_set_line_cap(cr, CAIRO_LINE_CAP_ROUND);
+      cairo_set_line_join(cr, CAIRO_LINE_JOIN_ROUND);
+      setSource(cr, gPal.onAccent, k);
+      cairo_move_to(cr, -2.6, 0.2);
+      cairo_line_to(cr, -0.8, 2.0);
+      cairo_line_to(cr, 2.8, -2.2);
+      cairo_stroke(cr);
+    }
+  }
+  cairo_restore(cr);
 }
 
 }  // namespace draw

@@ -189,4 +189,30 @@ inline Parsed parse(const std::string& raw, bool allowSomeday = true) {
   return r;  // ok == false
 }
 
+
+// "Draft abstract @Thesis #writing !fri" -> title, list, tags, when. Shared by the editor and quick capture.
+struct Sigils {
+  std::string title, list, tags, when;
+  bool hasWhen = false;
+};
+
+inline Sigils parseSigils(const std::string& raw) {
+  Sigils out;
+  std::string cur;
+  auto flush = [&] {
+    if (cur.empty()) return;
+    if (cur.size() > 1 && cur[0] == '@') out.list = cur.substr(1);
+    else if (cur.size() > 1 && cur[0] == '#') out.tags += (out.tags.empty() ? "" : ",") + cur.substr(1);
+    else if (cur.size() > 1 && cur[0] == '!') { out.when = cur.substr(1); out.hasWhen = true; }
+    else out.title += (out.title.empty() ? "" : " ") + cur;
+    cur.clear();
+  };
+  for (char c : raw) {
+    if (c == ' ' || c == '\t') flush();
+    else cur += c;
+  }
+  flush();
+  return out;
+}
+
 }  // namespace guidates

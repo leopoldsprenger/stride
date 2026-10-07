@@ -5,9 +5,9 @@
 //   2. Quiet. Few colours, generous space, motion only where it carries meaning (completing, adding, moving).
 //   3. Fast. Local SQLite only; sync runs on a worker thread and never blocks a keystroke.
 //
-// It is a thin view over the same Store the TUI uses -- no data model of its own -- so the TUI, quick capture, the
-// Noctalia widget and this window can all be open against one database at once. A cheap PRAGMA data_version poll
-// notices their writes and refreshes.
+// It is a thin view over the same Store the TUI uses -- no data model of its own -- so the TUI, quick capture and
+// this window can all be open against one database at once. A cheap PRAGMA data_version poll notices their writes
+// and refreshes.
 #include "gui.h"
 
 #include <gtk/gtk.h>
@@ -16,14 +16,18 @@
 #include <atomic>
 #include <cmath>
 #include <functional>
+#include <map>
 #include <memory>
+#include <climits>
 #include <optional>
+#include <set>
 #include <thread>
 
 #include "config.h"
 #include "finder.h"
 #include "gui_dates.h"
 #include "gui_draw.h"
+#include "gui_md.h"
 #include "gui_theme.h"
 #include "sync.h"
 #include "util.h"
@@ -46,7 +50,16 @@ void setClass(GtkWidget* w, const char* c, bool on) { on ? addClass(w, c) : rmCl
 GtkWidget* label(const std::string& text, const char* css = nullptr, float xalign = 0.f) {
   GtkWidget* l = gtk_label_new(text.c_str());
   gtk_label_set_xalign(GTK_LABEL(l), xalign);
-  if (css) addClass(l, css);
+  if (css) {  // "meta faint" means two classes
+    std::string all = css;
+    for (size_t p = 0; p < all.size();) {
+      size_t sp = all.find(' ', p);
+      std::string one = all.substr(p, sp == std::string::npos ? std::string::npos : sp - p);
+      if (!one.empty()) addClass(l, one.c_str());
+      if (sp == std::string::npos) break;
+      p = sp + 1;
+    }
+  }
   return l;
 }
 
@@ -54,12 +67,14 @@ void clearChildren(GtkWidget* box) {
   while (GtkWidget* c = gtk_widget_get_first_child(box)) gtk_box_remove(GTK_BOX(box), c);
 }
 
+// Icons never hold a colour of their own: they hold a role and read the live palette every time they draw, so a theme
+// change recolours them without rebuilding anything.
+enum class Role { Identity, Fg2, Fg3, Fg3Faint, Accent, Red };
+
 struct IconData {
   Icon icon;
   double param = 0;
-  bool useDefault = true;  // colour from the icon's own identity colour, else `color`
-  Rgba color;
-  bool fgIcon = false;     // follow gPal.fg2 live (theme flips)
+  Role role = Role::Identity;
 };
 
 GtkWidget* iconWidget(Icon ic, int size, double param = 0, bool tinted = true) {
@@ -67,13 +82,21 @@ GtkWidget* iconWidget(Icon ic, int size, double param = 0, bool tinted = true) {
   gtk_widget_set_size_request(da, size, size);
   gtk_widget_set_valign(da, GTK_ALIGN_CENTER);
   gtk_widget_set_halign(da, GTK_ALIGN_CENTER);
-  auto* d = new IconData{ic, param, tinted, {}, !tinted};
+  auto* d = new IconData{ic, param, tinted ? Role::Identity : Role::Fg2};
   g_object_set_data_full(G_OBJECT(da), "icon", d, [](gpointer p) { delete static_cast<IconData*>(p); });
   gtk_drawing_area_set_draw_func(
       GTK_DRAWING_AREA(da),
       [](GtkDrawingArea* area, cairo_t* cr, int w, int, gpointer) {
         auto* id = static_cast<IconData*>(g_object_get_data(G_OBJECT(area), "icon"));
-        Rgba c = id->useDefault ? draw::colorFor(id->icon) : (id->fgIcon ? gPal.fg2 : id->color);
+        Rgba c;
+        switch (id->role) {
+          case Role::Identity: c = draw::colorFor(id->icon); break;
+          case Role::Fg2: c = gPal.fg2; break;
+          case Role::Fg3: c = gPal.fg3; break;
+          case Role::Fg3Faint: c = withAlpha(gPal.fg3, 0.55); break;
+          case Role::Accent: c = gPal.accent; break;
+          case Role::Red: c = gPal.red; break;
+        }
         draw::icon(cr, id->icon, w, c, id->param);
       },
       nullptr, nullptr);
@@ -85,12 +108,20 @@ void iconSet(GtkWidget* da, Icon ic, double param) {
   d->param = param;
   gtk_widget_queue_draw(da);
 }
-void iconTint(GtkWidget* da, Rgba c) {
+void iconRole(GtkWidget* da, Role r) {
   auto* d = static_cast<IconData*>(g_object_get_data(G_OBJECT(da), "icon"));
-  d->useDefault = false;
-  d->fgIcon = false;
-  d->color = c;
+  d->role = r;
   gtk_widget_queue_draw(da);
+}
+
+void later(std::function<void()> fn) {
+  auto* f = new std::function<void()>(std::move(fn));
+  g_idle_add(+[](gpointer p) -> gboolean {
+    auto* fn = static_cast<std::function<void()>*>(p);
+    (*fn)();
+    delete fn;
+    return G_SOURCE_REMOVE;
+  }, f);
 }
 
 // A keycap pill ("↵", "Esc", "P").
@@ -140,27 +171,11 @@ std::string joinTags(const std::string& raw) {
 
 std::string entryText(GtkWidget* entry) { return gtk_editable_get_text(GTK_EDITABLE(entry)); }
 
-std::string textViewText(GtkWidget* tv) {
-  GtkTextBuffer* b = gtk_text_view_get_buffer(GTK_TEXT_VIEW(tv));
-  GtkTextIter s, e;
-  gtk_text_buffer_get_bounds(b, &s, &e);
-  char* t = gtk_text_buffer_get_text(b, &s, &e, FALSE);
-  std::string out = t ? t : "";
-  g_free(t);
-  return out;
-}
-
-// A multi-line text area with a ghost placeholder (GtkTextView has none of its own).
-GtkWidget* textArea(const std::string& initial, const std::string& placeholder, GtkWidget** viewOut) {
+// A markdown notes area with a ghost placeholder (GtkTextView has none of its own).
+GtkWidget* textArea(const std::string& initial, const std::string& placeholder, GtkWidget** viewOut, int minHeight = 38) {
   GtkWidget* ov = gtk_overlay_new();
-  GtkWidget* tv = gtk_text_view_new();
-  addClass(tv, "bare");
-  gtk_text_view_set_wrap_mode(GTK_TEXT_VIEW(tv), GTK_WRAP_WORD_CHAR);
-  gtk_text_view_set_accepts_tab(GTK_TEXT_VIEW(tv), FALSE);  // Tab walks the fields
-  gtk_text_view_set_top_margin(GTK_TEXT_VIEW(tv), 2);
-  gtk_text_view_set_bottom_margin(GTK_TEXT_VIEW(tv), 2);
-  gtk_text_buffer_set_text(gtk_text_view_get_buffer(GTK_TEXT_VIEW(tv)), initial.c_str(), -1);
-  gtk_widget_set_size_request(tv, -1, 38);
+  GtkWidget* tv = md::create(initial, false);
+  gtk_widget_set_size_request(tv, -1, minHeight);
   gtk_overlay_set_child(GTK_OVERLAY(ov), tv);
   GtkWidget* ph = label(placeholder, "hint");
   gtk_widget_set_can_target(ph, FALSE);
@@ -251,9 +266,13 @@ Icon smartIcon(const std::string& n) {
 class Gui;
 
 struct Row {
-  enum Type { Task, Section, Heading, More } type = Task;
+  enum Type { Task, Section, Heading, More, LogToggle } type = Task;
   Item item;
   std::string text;  // section / heading text
+  char groupKind = 0;  // Section rows of a grouped list: 'a' = area header, 'p' = project header, 0 = a plain section
+  int groupId = 0;
+  bool logged = false;  // a completed to-do in a project's logged timeline
+  double pie = -1;      // projects: share of to-dos done, for the pie inside the circle
   Gui* gui = nullptr;
   GtkWidget *revealer = nullptr, *box = nullptr, *check = nullptr, *strike = nullptr, *title = nullptr;
   // state
@@ -268,7 +287,8 @@ struct Row {
   guint tickId = 0;
   guint timer = 0;
   bool doneClass = false;
-  bool selectable() const { return type == Task || type == Heading || type == More; }
+  bool selectable() const { return type == Task || type == Heading || type == More || type == LogToggle; }
+  int level() const { return groupKind == 'p' ? 1 : 0; }  // nesting of a section header, for pruning
   ~Row() {
     if (timer) g_source_remove(timer);
     if (tickId && check) gtk_widget_remove_tick_callback(check, tickId);
@@ -290,36 +310,22 @@ struct ListRef {
   std::string kind;   // "Project" / "Area"
 };
 
-struct Sigils {
-  std::string title, list, tags, when;
-  bool hasWhen = false;
+// One checklist item in the editor: a small circle you tick, and its text.
+struct ClRow {
+  GtkWidget *row = nullptr, *circle = nullptr, *entry = nullptr;
+  bool done = false, hot = false;
+  double fill = 0, from = 0;
+  gint64 t0 = 0;
+  guint tick = 0;
 };
-
-Sigils parseSigils(const std::string& raw) {
-  Sigils out;
-  std::string cur;
-  auto flush = [&] {
-    if (cur.empty()) return;
-    if (cur.size() > 1 && cur[0] == '@') out.list = cur.substr(1);
-    else if (cur.size() > 1 && cur[0] == '#') out.tags += (out.tags.empty() ? "" : ",") + cur.substr(1);
-    else if (cur.size() > 1 && cur[0] == '!') { out.when = cur.substr(1); out.hasWhen = true; }
-    else out.title += (out.title.empty() ? "" : " ") + cur;
-    cur.clear();
-  };
-  for (char c : raw) {
-    if (c == ' ' || c == '\t') flush();
-    else cur += c;
-  }
-  flush();
-  return out;
-}
 
 struct Editor {
   bool isNew = false;
   Item orig;
   int headingId = 0;
   int afterSort = -1;  // insert after this sort order (new tasks)
-  GtkWidget *card = nullptr, *title = nullptr, *notes = nullptr, *checklist = nullptr, *checklistBox = nullptr;
+  GtkWidget *card = nullptr, *title = nullptr, *notes = nullptr, *clBox = nullptr, *clAddRow = nullptr;
+  std::vector<std::unique_ptr<ClRow>> cl;
   GtkWidget *when = nullptr, *deadline = nullptr, *tags = nullptr, *list = nullptr, *hint = nullptr;
   GtkWidget *whenField = nullptr, *deadlineField = nullptr, *listField = nullptr;
   Row* row = nullptr;
@@ -342,6 +348,67 @@ std::string deadlineLabel(const std::string& iso, bool& due) {
   return guidates::friendly(iso);
 }
 
+// "Mon 5 Oct" / "Yesterday" -- when a logged item was checked off.
+std::string completedLabel(const Item& it) {
+  std::string pre = it.status == "cancelled" ? "Canceled" : "";
+  if (it.completedAt.size() < 10) return pre;
+  std::string f = guidates::friendly(it.completedAt.substr(0, 10));
+  return pre.empty() ? f : pre + "  ·  " + f;
+}
+
+double projectFraction(Store& s, int projectId) {
+  auto all = s.viewProject(projectId, "", false);
+  if (all.empty()) return 0.0;
+  int done = 0, n = 0;
+  for (auto& t : all) {
+    if (t.kind != 't') continue;
+    ++n;
+    if (t.status == "done") ++done;
+  }
+  return n ? (double)done / n : 0.0;
+}
+
+// The order lists appear in the sidebar -- loose projects, then each area followed by its projects -- as one running
+// number, so a grouped to-do list can follow the sidebar exactly.
+struct Ord {
+  struct Info {
+    char kind = 'a';  // 'a' area, 'p' project
+    int id = 0, areaId = 0;
+    std::string name, areaName;
+  };
+  std::map<int, int> proj, area;  // id -> position
+  std::vector<Info> info;
+};
+
+Ord buildOrd(Store& s) {
+  Ord o;
+  auto add = [&](Ord::Info i) {
+    (i.kind == 'a' ? o.area : o.proj)[i.id] = (int)o.info.size();
+    o.info.push_back(std::move(i));
+  };
+  auto projects = s.projects();
+  for (auto& p : projects)
+    if (s.projectAreaId(p.id) == 0) add({'p', p.id, 0, p.name, ""});
+  for (auto& a : s.areas()) {
+    add({'a', a.id, 0, a.name, ""});
+    for (auto& p : s.projectsInArea(a.id, false)) add({'p', p.id, a.id, p.name, a.name});
+  }
+  return o;
+}
+
+// -1 = on no list at all (sorts first, no header).
+int ordKey(const Ord& o, const Item& it) {
+  if (it.kind == 't' && it.projectId) {
+    auto f = o.proj.find(it.projectId);
+    if (f != o.proj.end()) return f->second;
+  }
+  if (it.areaId) {
+    auto f = o.area.find(it.areaId);
+    if (f != o.area.end()) return f->second;
+  }
+  return -1;
+}
+
 class Gui {
  public:
   explicit Gui(Store& s) : s_(s) {}
@@ -356,7 +423,7 @@ class Gui {
   GtkApplication* app_ = nullptr;
   GtkWidget *win_ = nullptr, *overlay_ = nullptr, *sbRevealer_ = nullptr, *sbBox_ = nullptr, *mainScroll_ = nullptr,
             *content_ = nullptr, *headerIcon_ = nullptr, *titleLabel_ = nullptr, *crumbLabel_ = nullptr,
-            *notesLabel_ = nullptr, *listBox_ = nullptr, *syncIcon_ = nullptr, *syncDot_ = nullptr,
+            *notesBox_ = nullptr, *listBox_ = nullptr, *syncIcon_ = nullptr, *syncDot_ = nullptr,
             *syncBtn_ = nullptr, *toastBox_ = nullptr, *toastLabel_ = nullptr, *toastKey_ = nullptr,
             *modalLayer_ = nullptr, *modalHost_ = nullptr, *emptyState_ = nullptr;
   View view_;
@@ -389,7 +456,15 @@ class Gui {
   int justAddedId_ = 0, justRestoredId_ = 0;
   Scroller scroller_;
   guint toastShowSrc_ = 0, toastHideSrc_ = 0, toastGoneSrc_ = 0;
-  guint themeApplied_ = 0;
+  guint themeApplied_ = 0, themeDebounce_ = 0;
+  unsigned modalGen_ = 0;
+  std::string notesShown_;
+  long themeStamp_ = 0;
+  int pollTick_ = 0;
+  bool grouped_ = false;                 // Shift+A: group Today / Tomorrow / Anytime / Someday by area and project
+  std::map<int, bool> loggedShown_;      // per project: is the logged-to-dos timeline expanded?
+  std::vector<Item> logged_;             // completed to-dos of the project on screen, newest first
+  size_t loggedHidden_ = 0;
 
   // shared so the handler that is currently running can close its own modal without destroying itself mid-call
   std::shared_ptr<std::function<bool(guint, GdkModifierType)>> modalKey_;
@@ -415,7 +490,8 @@ class Gui {
 
   // ---- plumbing -------------------------------------------------------------------------------------------
   GtkCssProvider* css_ = nullptr;
-  void applyTheme();
+  void applyTheme(bool force = false);
+  void scheduleTheme();
   void buildWindow();
   void buildSidebar();
   void refreshSidebar();
@@ -438,6 +514,20 @@ class Gui {
   void buildEmptyState();
   void updateHeader();
   void refreshCounts();
+  bool groupable() const;
+  bool groupActive() const { return grouped_ && groupable(); }
+  void toggleGrouping();
+  void toggleLogged();
+  bool loggedExpanded() const;
+  GtkWidget* buildGroupHeader(Row& r);
+  GtkWidget* buildLogToggle(Row& r);
+  void openLink(const std::string& url);
+  void linkFallback(const std::string& url);
+  void newProject();
+  void newArea();
+  void chooseNewList();
+  void editList();
+  void completeList();
   std::string sectionLabel(const Item& x) const;
   void addSectionClasses();
 
@@ -476,6 +566,11 @@ class Gui {
   bool applyEditor(int& savedId);
   bool finishEditor(bool save, bool thenNew = false);
   void destroyEditorWidgets();
+  ClRow* addChecklistRow(int index, const std::string& text, bool done, bool focus);
+  void removeChecklistRow(ClRow* c);
+  void toggleChecklistRow(ClRow* c);
+  bool editorKey(guint keyval, GdkModifierType state);
+  Row* lastOpenRow() const;
   void updateEditorHint();
   ListRef resolveList(const std::string& q);
   GtkWidget* editorField(const char* cap, GtkWidget** entry, const std::string& text, const char* placeholder, GtkWidget** fieldBox);
@@ -520,9 +615,11 @@ class Gui {
 // activation, theme, window
 // ---------------------------------------------------------------------------------------------------------------
 
-void Gui::applyTheme() {
-  const char* acc = std::getenv("STRIDE_ACCENT");
-  gPal = makePalette(detectDark(), acc ? acc : "");
+void Gui::applyTheme(bool force) {
+  Palette np = resolvePalette();
+  themeStamp_ = themeCssStamp();
+  if (!force && css_ && samePalette(np, gPal)) return;
+  gPal = np;
   if (!css_) {
     css_ = gtk_css_provider_new();
     gtk_style_context_add_provider_for_display(gdk_display_get_default(), GTK_STYLE_PROVIDER(css_),
@@ -531,27 +628,37 @@ void Gui::applyTheme() {
   std::string css = buildCss(gPal);
   css += ".section.selected { background-color: " + cssColor(gPal.select) + "; border-radius: 8px; border-bottom-color: transparent; }\n";
   gtk_css_provider_load_from_string(css_, css.c_str());
+  md::repaintAll();
   if (win_) gtk_widget_queue_draw(win_);
+}
+
+// GTK reloads a changed theme asynchronously, so wait a beat before reading its colours back.
+void Gui::scheduleTheme() {
+  if (themeDebounce_) g_source_remove(themeDebounce_);
+  themeDebounce_ = g_timeout_add(140, +[](gpointer p) -> gboolean {
+    auto* g = static_cast<Gui*>(p);
+    g->themeDebounce_ = 0;
+    g->applyTheme(false);
+    return G_SOURCE_REMOVE;
+  }, this);
 }
 
 void Gui::activate(GtkApplication* app) {
   app_ = app;
   if (GtkSettings* st = gtk_settings_get_default()) {
-    // follow the desktop's light/dark flips live
-    for (const char* sig : {"notify::gtk-application-prefer-dark-theme", "notify::gtk-theme-name",
-                            "notify::gtk-interface-color-scheme"}) {
-      if (g_str_has_prefix(sig, "notify::")) {
-        const char* prop = sig + 8;
-        if (!g_object_class_find_property(G_OBJECT_GET_CLASS(st), prop)) continue;
-      }
-      g_signal_connect_swapped(st, sig, G_CALLBACK(+[](gpointer self) { static_cast<Gui*>(self)->applyTheme(); }), this);
+    // follow the active GTK theme live: a new theme name, a dark/light flip, a new colour scheme
+    for (const char* prop : {"gtk-theme-name", "gtk-application-prefer-dark-theme", "gtk-interface-color-scheme"}) {
+      if (!g_object_class_find_property(G_OBJECT_GET_CLASS(st), prop)) continue;
+      std::string sig = std::string("notify::") + prop;
+      g_signal_connect_swapped(st, sig.c_str(), G_CALLBACK(+[](gpointer self) { static_cast<Gui*>(self)->scheduleTheme(); }), this);
     }
   }
   {
     Config cfg((dataDir() / "config").string());
     remote_ = cfg.get("mirror_remote").value_or("");
   }
-  applyTheme();
+  md::gOpenLink = [this](const std::string& u) { openLink(u); };
+  applyTheme(true);
   buildWindow();
   lastDataVersion_ = s_.dataVersion();
   goTo(View{View::Smart, "Today", 0, "Today"}, false);
@@ -597,6 +704,18 @@ void Gui::buildWindow() {
   sbBox_ = vbox(0);
   gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(sbScroll), sbBox_);
   gtk_box_append(GTK_BOX(side), sbScroll);
+  GtkWidget* sbFoot = hbox(0);
+  addClass(sbFoot, "sb-foot");
+  GtkWidget* nl = hbox(8);
+  addClass(nl, "sb-new");
+  GtkWidget* nlIcon = iconWidget(Icon::Plus, 15, 0, true);
+  iconRole(nlIcon, Role::Accent);
+  gtk_box_append(GTK_BOX(nl), nlIcon);
+  gtk_box_append(GTK_BOX(nl), label("New List", "sb-new-label"));
+  gtk_widget_set_tooltip_text(nl, "New project or area  (P / A)");
+  onClick(nl, [this] { chooseNewList(); });
+  gtk_box_append(GTK_BOX(sbFoot), nl);
+  gtk_box_append(GTK_BOX(side), sbFoot);
   gtk_revealer_set_child(GTK_REVEALER(sbRevealer_), side);
   gtk_box_append(GTK_BOX(root), sbRevealer_);
 
@@ -624,11 +743,17 @@ void Gui::buildWindow() {
   titleLabel_ = label("Today", "page-title");
   gtk_box_append(GTK_BOX(titleRow), titleLabel_);
   gtk_box_append(GTK_BOX(hdr), titleRow);
-  notesLabel_ = label("", "page-notes");
-  gtk_label_set_wrap(GTK_LABEL(notesLabel_), TRUE);
-  gtk_label_set_wrap_mode(GTK_LABEL(notesLabel_), PANGO_WRAP_WORD_CHAR);
-  gtk_widget_set_margin_top(notesLabel_, 6);
-  gtk_box_append(GTK_BOX(hdr), notesLabel_);
+  notesBox_ = vbox(0);
+  gtk_widget_set_margin_top(notesBox_, 6);
+  gtk_box_append(GTK_BOX(hdr), notesBox_);
+  {  // double-click the title or the description to edit the project / rename the area
+    GtkGesture* dc = gtk_gesture_click_new();
+    gtk_gesture_single_set_button(GTK_GESTURE_SINGLE(dc), GDK_BUTTON_PRIMARY);
+    g_signal_connect(dc, "pressed", G_CALLBACK(+[](GtkGestureClick*, int n, double, double, gpointer p) {
+      if (n == 2) static_cast<Gui*>(p)->editList();
+    }), this);
+    gtk_widget_add_controller(hdr, GTK_EVENT_CONTROLLER(dc));
+  }
   gtk_window_handle_set_child(GTK_WINDOW_HANDLE(hdrHandle), hdr);
   gtk_box_append(GTK_BOX(content_), hdrHandle);
 
@@ -695,7 +820,7 @@ GtkWidget* Gui::buildFooter() {
   GtkWidget* nb = hbox(8);
   addClass(nb, "foot-btn");
   GtkWidget* plus = iconWidget(Icon::Plus, 16, 0, true);
-  iconTint(plus, gPal.accent);
+  iconRole(plus, Role::Accent);
   gtk_box_append(GTK_BOX(nb), plus);
   gtk_box_append(GTK_BOX(nb), label("New To-Do", "new-label"));
   gtk_widget_set_tooltip_text(nb, "New to-do  (N)");
@@ -898,10 +1023,27 @@ void Gui::jumpToTask(const Item& t) {
 // data -> widgets
 // ---------------------------------------------------------------------------------------------------------------
 
+bool Gui::groupable() const {
+  return view_.kind == View::Smart &&
+         (view_.name == "Today" || view_.name == "Tomorrow" || view_.name == "Anytime" || view_.name == "Someday");
+}
+
+bool Gui::loggedExpanded() const {
+  auto it = loggedShown_.find(view_.id);
+  if (it != loggedShown_.end()) return it->second;
+  return !const_cast<Store&>(s_).projectIsOpen(view_.id);  // a finished project opens with its history showing
+}
+
 void Gui::fetchItems() {
   items_.clear();
-  if (view_.kind == View::Project) items_ = s_.viewProject(view_.id, "", s_.projectIsOpen(view_.id));
-  else if (view_.kind == View::Area) items_ = s_.viewArea(view_.id, "");
+  logged_.clear();
+  if (view_.kind == View::Project) {
+    for (auto& t : s_.viewProject(view_.id, "", false)) {
+      if (t.kind == 't' && t.status != "open") logged_.push_back(t);
+      else items_.push_back(t);
+    }
+    std::stable_sort(logged_.begin(), logged_.end(), [](const Item& a, const Item& b) { return a.completedAt > b.completedAt; });
+  } else if (view_.kind == View::Area) items_ = s_.viewArea(view_.id, "");
   else {
     const auto& n = view_.name;
     if (n == "Inbox") items_ = s_.viewInbox("");
@@ -915,11 +1057,31 @@ void Gui::fetchItems() {
     else if (n == "Logged Projects") items_ = s_.viewLoggedProjects();
     else if (n == "Archived Areas") items_ = s_.viewArchivedAreas();
   }
+  if (groupActive()) {  // same order as the sidebar; to-dos keep their own order within a list
+    Ord o = buildOrd(s_);
+    std::stable_sort(items_.begin(), items_.end(), [&](const Item& a, const Item& b) { return ordKey(o, a) < ordKey(o, b); });
+  }
   hiddenCount_ = 0;
   if (items_.size() > limit_) {
     hiddenCount_ = items_.size() - limit_;
     items_.resize(limit_);
   }
+}
+
+void Gui::toggleGrouping() {
+  if (!groupable()) {
+    toast("Grouping works in Today, Tomorrow, Anytime and Someday");
+    return;
+  }
+  grouped_ = !grouped_;
+  reload(true);
+  toast(grouped_ ? "Grouped by area and project" : "Grouping off", "\xe2\x87\xa7" "A");
+}
+
+void Gui::toggleLogged() {
+  if (view_.kind != View::Project) return;
+  loggedShown_[view_.id] = !loggedExpanded();
+  reload(true);
 }
 
 std::string Gui::sectionLabel(const Item& x) const {
@@ -978,8 +1140,24 @@ void Gui::rebuildRows() {
   rows_.clear();
   sel_ = nullptr;
   emptyState_ = nullptr;
+  loggedHidden_ = 0;
   clearChildren(listBox_);
 
+  auto pushSection = [&](const std::string& text, char kind, int id) {
+    auto hdr = std::make_unique<Row>();
+    hdr->gui = this;
+    hdr->type = Row::Section;
+    hdr->text = text;
+    hdr->groupKind = kind;
+    hdr->groupId = id;
+    gtk_box_append(GTK_BOX(listBox_), buildSimpleRow(*hdr));
+    rows_.push_back(std::move(hdr));
+  };
+
+  bool grp = groupActive();
+  Ord ord;
+  if (grp) ord = buildOrd(s_);
+  int lastKey = INT_MIN, lastAreaHeader = 0;
   std::string lastSection;
   for (auto& it : items_) {
     auto row = std::make_unique<Row>();
@@ -990,15 +1168,30 @@ void Gui::rebuildRows() {
       row->text = it.title;
       lastSection.clear();
     } else {
-      std::string sec = sectionLabel(it);
-      if (!sec.empty() && sec != lastSection) {
-        auto hdr = std::make_unique<Row>();
-        hdr->gui = this;
-        hdr->type = Row::Section;
-        hdr->text = sec;
-        gtk_box_append(GTK_BOX(listBox_), buildSimpleRow(*hdr));
-        rows_.push_back(std::move(hdr));
-        lastSection = sec;
+      if (grp) {
+        int k = ordKey(ord, it);
+        if (k != lastKey) {
+          lastKey = k;
+          if (k < 0) {
+            lastAreaHeader = 0;
+          } else {
+            const auto& inf = ord.info[k];
+            if (inf.kind == 'a') {
+              pushSection(inf.name, 'a', inf.id);
+              lastAreaHeader = inf.id;
+            } else {
+              if (inf.areaId && inf.areaId != lastAreaHeader) pushSection(inf.areaName, 'a', inf.areaId);
+              lastAreaHeader = inf.areaId;
+              pushSection(inf.name, 'p', inf.id);
+            }
+          }
+        }
+      } else {
+        std::string sec = sectionLabel(it);
+        if (!sec.empty() && sec != lastSection) {
+          pushSection(sec, 0, 0);
+          lastSection = sec;
+        }
       }
       row->type = Row::Task;
       row->done = it.status != "open";
@@ -1007,16 +1200,45 @@ void Gui::rebuildRows() {
     else buildTaskRow(*row, false);
     rows_.push_back(std::move(row));
   }
-  if (hiddenCount_) {
+
+  // the logged to-dos of a project: a quiet toggle, and under it a plain timeline, newest check-off first
+  if (view_.kind == View::Project && !logged_.empty()) {
+    auto tg = std::make_unique<Row>();
+    tg->gui = this;
+    tg->type = Row::LogToggle;
+    bool open = loggedExpanded();
+    tg->text = std::string(open ? "Hide " : "Show ") + std::to_string(logged_.size()) + (logged_.size() == 1 ? " logged to-do" : " logged to-dos");
+    gtk_box_append(GTK_BOX(listBox_), buildSimpleRow(*tg));
+    rows_.push_back(std::move(tg));
+    if (open) {
+      size_t shown = 0;
+      for (auto& it : logged_) {
+        if (shown >= limit_) {
+          loggedHidden_ = logged_.size() - shown;
+          break;
+        }
+        auto row = std::make_unique<Row>();
+        row->gui = this;
+        row->item = it;
+        row->type = Row::Task;
+        row->done = true;
+        row->logged = true;
+        buildTaskRow(*row, false);
+        rows_.push_back(std::move(row));
+        ++shown;
+      }
+    }
+  }
+  if (hiddenCount_ + loggedHidden_) {
     auto more = std::make_unique<Row>();
     more->gui = this;
     more->type = Row::More;
-    more->text = "Show " + std::to_string(hiddenCount_) + " more…";
+    more->text = "Show " + std::to_string(hiddenCount_ + loggedHidden_) + " more…";
     gtk_box_append(GTK_BOX(listBox_), buildSimpleRow(*more));
     rows_.push_back(std::move(more));
   }
   addSectionClasses();
-  if (items_.empty()) buildEmptyState();
+  if (items_.empty() && logged_.empty()) buildEmptyState();
 }
 
 void Gui::addSectionClasses() {
@@ -1029,10 +1251,35 @@ void Gui::addSectionClasses() {
 }
 
 // Section / heading / "show more" rows: plain labels inside a revealer (so they can collapse like task rows).
+GtkWidget* Gui::buildGroupHeader(Row& r) {
+  bool area = r.groupKind == 'a';
+  GtkWidget* h = hbox(8);
+  addClass(h, area ? "group-area" : "group-proj");
+  GtkWidget* ic = area ? iconWidget(Icon::Area, 16, 0, false) : iconWidget(Icon::Project, 15, projectFraction(s_, r.groupId), false);
+  iconRole(ic, area ? Role::Fg2 : Role::Fg3);
+  gtk_box_append(GTK_BOX(h), ic);
+  GtkWidget* l = label(r.text);
+  gtk_label_set_ellipsize(GTK_LABEL(l), PANGO_ELLIPSIZE_END);
+  gtk_box_append(GTK_BOX(h), l);
+  return h;
+}
+
+GtkWidget* Gui::buildLogToggle(Row& r) {
+  GtkWidget* h = hbox(8);
+  addClass(h, "log-toggle");
+  gtk_box_append(GTK_BOX(h), label(r.text, "log-toggle-label"));
+  return h;
+}
+
 GtkWidget* Gui::buildSimpleRow(Row& r) {
-  GtkWidget* l = label(r.text, r.type == Row::More ? "more-row" : "section");
-  if (r.type == Row::Heading) addClass(l, "heading");
-  if (r.type == Row::More) { gtk_widget_set_margin_start(l, 28); gtk_widget_set_margin_top(l, 8); gtk_widget_set_margin_bottom(l, 8); }
+  GtkWidget* l;
+  if (r.type == Row::Section && r.groupKind) l = buildGroupHeader(r);
+  else if (r.type == Row::LogToggle) l = buildLogToggle(r);
+  else {
+    l = label(r.text, r.type == Row::More ? "more-row" : "section");
+    if (r.type == Row::Heading) addClass(l, "heading");
+    if (r.type == Row::More) { gtk_widget_set_margin_start(l, 28); gtk_widget_set_margin_top(l, 8); gtk_widget_set_margin_bottom(l, 8); }
+  }
   r.box = l;
   GtkWidget* rev = gtk_revealer_new();
   gtk_revealer_set_transition_type(GTK_REVEALER(rev), GTK_REVEALER_TRANSITION_TYPE_SLIDE_DOWN);
@@ -1042,7 +1289,12 @@ GtkWidget* Gui::buildSimpleRow(Row& r) {
   r.revealer = rev;
   if (r.type != Row::Section) {
     Row* rp = &r;
-    onClick(l, [this, rp] { if (editor_ && !finishEditor(true)) return; select(rp, false); if (rp->type == Row::More) activateSel(); });
+    onClick(l, [this, rp] {
+      if (editor_ && !finishEditor(true)) return;
+      select(rp, false);
+      // the list is rebuilt by these two, so let the click finish before its own row goes away
+      if (rp->type == Row::More || rp->type == Row::LogToggle) later([this] { activateSel(); });
+    });
   }
   return rev;
 }
@@ -1066,7 +1318,7 @@ void Gui::buildEmptyState() {
   } else if (view_.kind == View::Project) { t = "An empty project"; s = "Press N to add the first to-do, Shift+N for a heading."; ic = Icon::Project; }
   else { t = "An empty area"; s = "Press N to add a to-do to this area."; ic = Icon::Area; }
   GtkWidget* i = iconWidget(ic, 46, 0, false);
-  iconTint(i, withAlpha(gPal.fg3, 0.55));
+  iconRole(i, Role::Fg3Faint);
   gtk_box_append(GTK_BOX(emptyState_), i);
   gtk_widget_set_margin_bottom(i, 8);
   gtk_box_append(GTK_BOX(emptyState_), label(t, "page-empty-title", 0.5f));
@@ -1089,14 +1341,29 @@ void Gui::updateHeader() {
     param = all.empty() ? 0 : (double)done / all.size();
     if (!s_.projectIsOpen(view_.id)) crumb = (crumb.empty() ? "" : crumb + "  ·  ") + "Logged";
   }
+  if (groupActive()) crumb = "Grouped by area and project  ·  \xe2\x87\xa7" "A to turn off";
   gtk_label_set_text(GTK_LABEL(titleLabel_), title.c_str());
   gtk_label_set_text(GTK_LABEL(crumbLabel_), crumb.c_str());
   gtk_widget_set_visible(crumbLabel_, !crumb.empty());
-  gtk_label_set_text(GTK_LABEL(notesLabel_), notes.c_str());
-  gtk_widget_set_visible(notesLabel_, !notes.empty());
+  if (notes != notesShown_ || (!notes.empty() && !gtk_widget_get_first_child(notesBox_))) {  // keep the view if nothing changed
+    notesShown_ = notes;
+    clearChildren(notesBox_);
+    if (!notes.empty()) {
+      GtkWidget* l = label("", "page-notes");
+      gtk_label_set_markup(GTK_LABEL(l), md::toPango(notes).c_str());
+      gtk_label_set_wrap(GTK_LABEL(l), TRUE);
+      gtk_label_set_wrap_mode(GTK_LABEL(l), PANGO_WRAP_WORD_CHAR);
+      gtk_label_set_xalign(GTK_LABEL(l), 0);
+      g_signal_connect(l, "activate-link", G_CALLBACK(+[](GtkLabel*, const char* uri, gpointer) -> gboolean {
+        if (md::gOpenLink) md::gOpenLink(uri);
+        return TRUE;
+      }), nullptr);
+      gtk_box_append(GTK_BOX(notesBox_), l);
+    }
+  }
+  gtk_widget_set_visible(notesBox_, !notes.empty());
   iconSet(headerIcon_, ic, param);
-  if (view_.kind == View::Smart) iconTint(headerIcon_, draw::colorFor(ic));
-  else iconTint(headerIcon_, gPal.fg2);
+  iconRole(headerIcon_, view_.kind == View::Smart ? Role::Identity : Role::Fg2);
   gtk_window_set_title(GTK_WINDOW(win_), ("Stride — " + title).c_str());
 }
 
@@ -1113,15 +1380,6 @@ void revealLater(GtkWidget* rev) {
     g_object_unref(w);
     return G_SOURCE_REMOVE;
   }, rev);
-}
-void later(std::function<void()> fn) {
-  auto* f = new std::function<void()>(std::move(fn));
-  g_idle_add(+[](gpointer p) -> gboolean {
-    auto* fn = static_cast<std::function<void()>*>(p);
-    (*fn)();
-    delete fn;
-    return G_SOURCE_REMOVE;
-  }, f);
 }
 double strikeProgress(const Row* r) {
   if (r->animating) {
@@ -1140,6 +1398,9 @@ void Gui::buildTaskRow(Row& r, bool animateIn) {
   addClass(box, "task-row");
   if (it.someday) addClass(box, "someday");
   if (isProject) addClass(box, "project");
+  if (r.logged) addClass(box, "logged");
+  if (r.done) { addClass(box, "done"); r.doneClass = true; }  // finished items read grey
+  if (isProject && !r.done) r.pie = projectFraction(s_, it.id);
   r.box = box;
 
   // -- checkbox --
@@ -1150,7 +1411,9 @@ void Gui::buildTaskRow(Row& r, bool animateIn) {
   gtk_drawing_area_set_draw_func(GTK_DRAWING_AREA(check), +[](GtkDrawingArea*, cairo_t* cr, int w, int h, gpointer ud) {
     auto* rr = static_cast<Row*>(ud);
     auto pose = draw::checkPose(rr->done, rr->animT, rr->animating, rr->animToDone);
-    draw::checkbox(cr, w, h, pose, rr->hot || rr->gui->sel_ == rr, rr->item.kind != 't');
+    pose.muted = rr->done && !rr->animating && !rr->pendingRemoval;  // finished and settled: grey, not accent
+    draw::checkbox(cr, w, h, pose, rr->hot || rr->gui->sel_ == rr,
+                   rr->item.kind == 't' ? draw::Shape::Square : draw::Shape::Circle, rr->pie);
   }, &r, nullptr);
   GtkEventController* mc = gtk_event_controller_motion_new();
   g_signal_connect(mc, "enter", G_CALLBACK(+[](GtkEventControllerMotion*, double, double, gpointer p) {
@@ -1197,7 +1460,7 @@ void Gui::buildTaskRow(Row& r, bool animateIn) {
   gtk_box_append(GTK_BOX(mid), ov);
 
   std::string ctx;
-  bool showCtx = view_.kind == View::Smart && view_.name != "Inbox";
+  bool showCtx = view_.kind == View::Smart && view_.name != "Inbox" && !groupActive();
   if (showCtx) ctx = isProject ? it.areaName : (!it.projectName.empty() ? it.projectName : it.areaName);
   if (!ctx.empty()) gtk_box_append(GTK_BOX(mid), label(ctx, "task-sub"));
   gtk_box_append(GTK_BOX(box), mid);
@@ -1218,42 +1481,46 @@ void Gui::buildTaskRow(Row& r, bool animateIn) {
     for (auto& c : cl) dn += c.done ? 1 : 0;
     GtkWidget* g = hbox(4);
     GtkWidget* i = iconWidget(Icon::Checklist, 13, 0, false);
-    iconTint(i, gPal.fg3);
+    iconRole(i, Role::Fg3);
     gtk_box_append(GTK_BOX(g), i);
     gtk_box_append(GTK_BOX(g), label(std::to_string(dn) + "/" + std::to_string(cl.size()), "meta faint"));
     gtk_box_append(GTK_BOX(meta), g);
   }
   if (!it.notes.empty() && !isProject) {
     GtkWidget* i = iconWidget(Icon::Note, 13, 0, false);
-    iconTint(i, gPal.fg3);
+    iconRole(i, Role::Fg3);
     gtk_box_append(GTK_BOX(meta), i);
   }
   std::string dd;
   if (it.someday || it.doDate == "someday") { if (view_.name != "Someday") dd = "Someday"; }
   else if (!it.doDate.empty()) {
-    bool hide = view_.isLogLike() || view_.name == "Upcoming" || (view_.name == "Today" && it.doDate == today()) ||
+    bool hide = view_.isLogLike() || r.logged || view_.name == "Upcoming" || (view_.name == "Today" && it.doDate == today()) ||
                 (view_.name == "Tomorrow" && it.doDate == todayPlus(1));
     if (!hide) dd = guidates::friendly(it.doDate);
   }
   if (!dd.empty()) {
     GtkWidget* g = hbox(4);
     GtkWidget* i = iconWidget(Icon::Calendar, 13, 0, false);
-    iconTint(i, gPal.fg3);
+    iconRole(i, Role::Fg3);
     gtk_box_append(GTK_BOX(g), i);
     gtk_box_append(GTK_BOX(g), label(dd, "meta"));
     gtk_box_append(GTK_BOX(meta), g);
   }
-  if (!it.deadline.empty() && !view_.isLogLike()) {
+  if (!it.deadline.empty() && !view_.isLogLike() && !r.logged) {
     bool due = false;
     std::string txt = deadlineLabel(it.deadline, due);
     GtkWidget* g = hbox(4);
     GtkWidget* i = iconWidget(Icon::Flag, 13, 0, false);
-    iconTint(i, due ? gPal.red : gPal.fg3);
+    iconRole(i, due ? Role::Red : Role::Fg3);
     gtk_box_append(GTK_BOX(g), i);
     GtkWidget* l = label(txt, "meta");
     if (due) addClass(l, "due");
     gtk_box_append(GTK_BOX(g), l);
     gtk_box_append(GTK_BOX(meta), g);
+  }
+  if (it.status != "open" || r.logged) {  // when it was checked off
+    std::string when = completedLabel(it);
+    if (!when.empty()) gtk_box_append(GTK_BOX(meta), label(when, "meta logged"));
   }
   gtk_box_append(GTK_BOX(box), meta);
 
@@ -1411,26 +1678,28 @@ void Gui::dropRow(Row* r) {
   pruneEmptySections();
   if (wasSel && next) select(next);
   bool any = false;
-  for (auto& x : rows_) any = any || x->type == Row::Task || x->type == Row::More;
+  for (auto& x : rows_) any = any || x->type == Row::Task || x->type == Row::More || x->type == Row::LogToggle;
   bool anyHeading = false;
   for (auto& x : rows_) anyHeading = anyHeading || x->type == Row::Heading;
   if (!any && !anyHeading && !emptyState_) buildEmptyState();
   refreshCounts();
+  if (view_.kind == View::Project) {  // once everything has settled, let the finished to-dos join the logged timeline
+    bool busy = false;
+    for (auto& x : rows_) busy = busy || x->pendingRemoval || x->leaving || x->animating;
+    if (!busy) later([this] { if (!editor_) reload(true); });
+  }
 }
 
 void Gui::pruneEmptySections() {
-  for (size_t i = 0; i < rows_.size();) {
+  for (int i = (int)rows_.size() - 1; i >= 0; --i) {  // backwards, so an emptied project header takes its area with it
     Row* r = rows_[i].get();
-    bool orphan = false;
-    if (r->type == Row::Section) {
-      Row* n = i + 1 < rows_.size() ? rows_[i + 1].get() : nullptr;
-      orphan = !n || n->type == Row::Section || n->type == Row::Heading;
-    }
+    if (r->type != Row::Section) continue;
+    Row* n = i + 1 < (int)rows_.size() ? rows_[i + 1].get() : nullptr;
+    bool orphan = !n || n->type == Row::Heading || n->type == Row::LogToggle ||
+                  (n->type == Row::Section && n->level() <= r->level());
     if (orphan) {
       gtk_box_remove(GTK_BOX(listBox_), r->revealer);
       rows_.erase(rows_.begin() + i);
-    } else {
-      ++i;
     }
   }
 }
@@ -1455,6 +1724,17 @@ void Gui::toggleRow(Row* r) {
     markDirty();
     refreshCounts();
   } else {
+    if (r->logged) {
+      s_.reopen(it);
+      markDirty();
+      justRestoredId_ = it.id;
+      pendingSelId_ = it.id;
+      pendingSelKind_ = it.kind;
+      toast("Reopened");
+      refreshSidebar();
+      reload(true);
+      return;
+    }
     s_.reopen(it);
     bool wasPending = r->pendingRemoval;
     r->done = false;
@@ -1489,6 +1769,7 @@ void Gui::undo() {
   pendingSelId_ = u.id;
   pendingSelKind_ = u.kind;
   markDirty();
+  if (u.kind != 't') refreshSidebar();
   reload(true);
   toast("Restored");
 }
@@ -1513,6 +1794,10 @@ void Gui::activateSel() {
   if (r->type == Row::More) {
     limit_ += 400;
     reload(true);
+    return;
+  }
+  if (r->type == Row::LogToggle) {
+    toggleLogged();
     return;
   }
   if (r->type == Row::Heading) {
@@ -1600,7 +1885,7 @@ void Gui::pickList() {
 }
 
 void Gui::confirmDelete() {
-  if (!sel_ || sel_->type == Row::More || sel_->type == Row::Section) return;
+  if (!sel_ || sel_->type == Row::More || sel_->type == Row::Section || sel_->type == Row::LogToggle) return;
   Item it = sel_->item;
   bool heading = sel_->type == Row::Heading;
   std::string what = heading ? "heading" : (it.kind == 'p' ? "project" : "to-do");
@@ -1616,9 +1901,9 @@ void Gui::confirmDelete() {
 }
 
 void Gui::reorder(int dir) {
-  if (!sel_ || sel_->type != Row::Task) return;
+  if (!sel_ || sel_->type != Row::Task || sel_->logged) return;
   Row* n = nextSelectable(indexOf(sel_), dir);
-  if (!n || n->type != Row::Task || n->item.kind != sel_->item.kind) { toast("Can't move further"); return; }
+  if (!n || n->type != Row::Task || n->logged || n->item.kind != sel_->item.kind) { toast("Can't move further"); return; }
   s_.swapOrder(sel_->item, n->item);
   markDirty();
   pendingSelId_ = sel_->item.id;
@@ -1682,7 +1967,7 @@ void Gui::startEditor(std::unique_ptr<Editor> ep, GtkWidget* after, const std::s
   gtk_widget_set_size_request(cb, 26, 26);
   gtk_widget_set_valign(cb, GTK_ALIGN_START);
   gtk_drawing_area_set_draw_func(GTK_DRAWING_AREA(cb), +[](GtkDrawingArea*, cairo_t* cr, int w, int h, gpointer) {
-    draw::checkbox(cr, w, h, draw::checkPose(false, 0, false, true), false, false);
+    draw::checkbox(cr, w, h, draw::checkPose(false, 0, false, true), false, draw::Shape::Square);
   }, nullptr, nullptr);
   gtk_box_append(GTK_BOX(titleRow), cb);
   e.title = gtk_entry_new();
@@ -1699,11 +1984,21 @@ void Gui::startEditor(std::unique_ptr<Editor> ep, GtkWidget* after, const std::s
   gtk_widget_set_margin_start(body, 38);
   GtkWidget* notesW = textArea(it.notes, "Notes", &e.notes);
   gtk_box_append(GTK_BOX(body), notesW);
-  std::string cl;
-  for (auto& c : parseChecklist(it.checklist)) cl += std::string(c.done ? "[x] " : "[ ] ") + c.text + "\n";
-  if (!cl.empty()) cl.pop_back();
-  GtkWidget* clW = textArea(cl, "Checklist — one item per line, [x] marks it done", &e.checklist);
-  gtk_box_append(GTK_BOX(body), clW);
+  e.clBox = vbox(0);
+  gtk_box_append(GTK_BOX(body), e.clBox);
+  e.clAddRow = hbox(8);
+  addClass(e.clAddRow, "cl-add");
+  {
+    GtkWidget* pi = iconWidget(Icon::Plus, 13, 0, true);
+    iconRole(pi, Role::Fg3);
+    gtk_widget_set_size_request(pi, 18, -1);
+    gtk_box_append(GTK_BOX(e.clAddRow), pi);
+    gtk_box_append(GTK_BOX(e.clAddRow), label("Add checklist item"));
+    gtk_widget_set_tooltip_text(e.clAddRow, "Ctrl+L");
+    onClick(e.clAddRow, [this] { if (editor_) addChecklistRow(-1, "", false, true); });
+  }
+  gtk_box_append(GTK_BOX(body), e.clAddRow);
+  for (auto& c : parseChecklist(it.checklist)) addChecklistRow(-1, c.text, c.done, false);
 
   GtkWidget* grid = hbox(8);
   std::string tagsText;
@@ -1743,6 +2038,144 @@ void Gui::startEditor(std::unique_ptr<Editor> ep, GtkWidget* after, const std::s
   });
 }
 
+void Gui::toggleChecklistRow(ClRow* c) {
+  c->done = !c->done;
+  setClass(c->row, "done", c->done);
+  c->from = c->fill;
+  c->t0 = 0;
+  if (c->tick) return;
+  c->tick = gtk_widget_add_tick_callback(c->circle, +[](GtkWidget* w, GdkFrameClock* fc, gpointer ud) -> gboolean {
+    auto* cr = static_cast<ClRow*>(ud);
+    gint64 now = gdk_frame_clock_get_frame_time(fc);
+    if (!cr->t0) cr->t0 = now;
+    double t = (now - cr->t0) / 1000.0 / 190.0;
+    cr->fill = ease::lerp(cr->from, cr->done ? 1.0 : 0.0, ease::outCubic(t));
+    gtk_widget_queue_draw(w);
+    if (t >= 1) {
+      cr->tick = 0;
+      return G_SOURCE_REMOVE;
+    }
+    return G_SOURCE_CONTINUE;
+  }, c, nullptr);
+}
+
+ClRow* Gui::addChecklistRow(int index, const std::string& text, bool done, bool focus) {
+  Editor& e = *editor_;
+  auto owned = std::make_unique<ClRow>();
+  ClRow* c = owned.get();
+  c->done = done;
+  c->fill = done ? 1 : 0;
+  c->row = hbox(8);
+  addClass(c->row, "cl-row");
+  if (done) addClass(c->row, "done");
+  c->circle = gtk_drawing_area_new();
+  gtk_widget_set_size_request(c->circle, 18, 24);
+  gtk_widget_set_valign(c->circle, GTK_ALIGN_CENTER);
+  gtk_drawing_area_set_draw_func(GTK_DRAWING_AREA(c->circle), +[](GtkDrawingArea*, cairo_t* cr, int w, int h, gpointer ud) {
+    auto* x = static_cast<ClRow*>(ud);
+    draw::checklistCircle(cr, w, h, x->fill, x->hot);
+  }, c, nullptr);
+  GtkEventController* mc = gtk_event_controller_motion_new();
+  g_signal_connect(mc, "enter", G_CALLBACK(+[](GtkEventControllerMotion*, double, double, gpointer p) {
+    auto* x = static_cast<ClRow*>(p); x->hot = true; gtk_widget_queue_draw(x->circle);
+  }), c);
+  g_signal_connect(mc, "leave", G_CALLBACK(+[](GtkEventControllerMotion*, gpointer p) {
+    auto* x = static_cast<ClRow*>(p); x->hot = false; gtk_widget_queue_draw(x->circle);
+  }), c);
+  gtk_widget_add_controller(c->circle, mc);
+  onClick(c->circle, [this, c] { toggleChecklistRow(c); });
+  gtk_box_append(GTK_BOX(c->row), c->circle);
+  c->entry = gtk_entry_new();
+  addClass(c->entry, "bare");
+  gtk_entry_set_placeholder_text(GTK_ENTRY(c->entry), "Checklist item");
+  gtk_editable_set_text(GTK_EDITABLE(c->entry), text.c_str());
+  gtk_widget_set_hexpand(c->entry, TRUE);
+  gtk_widget_set_valign(c->entry, GTK_ALIGN_CENTER);
+  gtk_box_append(GTK_BOX(c->row), c->entry);
+
+  if (index < 0 || index > (int)e.cl.size()) index = (int)e.cl.size();
+  if (index == 0) gtk_box_prepend(GTK_BOX(e.clBox), c->row);
+  else gtk_box_insert_child_after(GTK_BOX(e.clBox), c->row, e.cl[index - 1]->row);
+  e.cl.insert(e.cl.begin() + index, std::move(owned));
+  if (focus) gtk_widget_grab_focus(c->entry);
+  return c;
+}
+
+void Gui::removeChecklistRow(ClRow* c) {
+  Editor& e = *editor_;
+  for (size_t i = 0; i < e.cl.size(); ++i)
+    if (e.cl[i].get() == c) {
+      if (c->tick) gtk_widget_remove_tick_callback(c->circle, c->tick);
+      c->tick = 0;
+      gtk_box_remove(GTK_BOX(e.clBox), c->row);
+      e.cl.erase(e.cl.begin() + i);
+      return;
+    }
+}
+
+// Keys that only mean something inside the open editor: the checklist, and Tab walking the fields.
+bool Gui::editorKey(guint kv, GdkModifierType st) {
+  Editor& e = *editor_;
+  bool ctrl = st & GDK_CONTROL_MASK, shift = st & GDK_SHIFT_MASK;
+  GtkWidget* f = gtk_window_get_focus(GTK_WINDOW(win_));
+  auto within = [&](GtkWidget* w) { return f && (f == w || gtk_widget_is_ancestor(f, w)); };
+  int cur = -1;
+  for (size_t i = 0; i < e.cl.size(); ++i)
+    if (within(e.cl[i]->entry)) cur = (int)i;
+
+  if (ctrl && (kv == GDK_KEY_l || kv == GDK_KEY_L)) {
+    addChecklistRow(cur >= 0 ? cur + 1 : -1, "", false, true);
+    return true;
+  }
+  if (ctrl) return false;
+
+  if (cur >= 0) {
+    ClRow* c = e.cl[cur].get();
+    bool empty = trimmed(entryText(c->entry)).empty();
+    if ((kv == GDK_KEY_Return || kv == GDK_KEY_KP_Enter) && !shift) {
+      if (empty && cur + 1 == (int)e.cl.size()) {  // Enter on an empty last item ends the list
+        removeChecklistRow(c);
+        gtk_widget_grab_focus(e.when);
+      } else {
+        addChecklistRow(cur + 1, "", false, true);
+      }
+      return true;
+    }
+    if (kv == GDK_KEY_BackSpace && empty) {
+      GtkWidget* to = cur > 0 ? e.cl[cur - 1]->entry : e.notes;
+      removeChecklistRow(c);
+      gtk_widget_grab_focus(to);
+      if (GTK_IS_EDITABLE(to)) gtk_editable_set_position(GTK_EDITABLE(to), -1);
+      return true;
+    }
+    if (kv == GDK_KEY_Up) {
+      gtk_widget_grab_focus(cur > 0 ? e.cl[cur - 1]->entry : e.notes);
+      return true;
+    }
+    if (kv == GDK_KEY_Down) {
+      gtk_widget_grab_focus(cur + 1 < (int)e.cl.size() ? e.cl[cur + 1]->entry : e.when);
+      return true;
+    }
+  }
+
+  if (kv == GDK_KEY_Tab || kv == GDK_KEY_ISO_Left_Tab) {
+    if (f == e.notes && md::wantsTab(e.notes)) return false;  // Tab nests a bullet
+    bool back = kv == GDK_KEY_ISO_Left_Tab || shift;
+    std::vector<GtkWidget*> stops = {e.title, e.notes};
+    if (!e.cl.empty()) stops.push_back(e.cl.front()->entry);
+    for (GtkWidget* w : {e.when, e.deadline, e.tags, e.list}) stops.push_back(w);
+    int at = 0;
+    for (size_t i = 0; i < stops.size(); ++i) {
+      bool here = within(stops[i]) || (!e.cl.empty() && i == 2 && cur >= 0);
+      if (here) at = (int)i;
+    }
+    int n = (int)stops.size();
+    gtk_widget_grab_focus(stops[((at + (back ? -1 : 1)) % n + n) % n]);
+    return true;
+  }
+  return false;
+}
+
 void Gui::openEditor(Row* r) {
   if (!r || r->type != Row::Task || r->item.kind != 't') return;
   auto e = std::make_unique<Editor>();
@@ -1767,15 +2200,24 @@ void Gui::newTask() {
   else if (view_.name == "Tomorrow") when = "tomorrow";
   else if (view_.name == "Someday") when = "someday";
   GtkWidget* after = nullptr;
-  if (sel_ && (sel_->type == Row::Task || sel_->type == Row::Heading)) {
+  if (sel_ && (sel_->type == Row::Task || sel_->type == Row::Heading) && !sel_->logged) {
     after = sel_->revealer;
     e->headingId = sel_->type == Row::Heading ? sel_->item.id : sel_->item.headingId;
     e->afterSort = sel_->type == Row::Task ? sel_->item.sortOrder : -1;
   } else if (!rows_.empty()) {
-    after = rows_.back()->revealer;
-    if (rows_.back()->type == Row::More) after = rows_.size() > 1 ? rows_[rows_.size() - 2]->revealer : nullptr;
+    Row* lr = lastOpenRow();
+    after = lr ? lr->revealer : nullptr;
   }
   startEditor(std::move(e), after, when, list);
+}
+
+Row* Gui::lastOpenRow() const {
+  for (int i = (int)rows_.size() - 1; i >= 0; --i) {
+    Row* r = rows_[i].get();
+    if (r->logged || r->type == Row::LogToggle || r->type == Row::More) continue;
+    return r;
+  }
+  return nullptr;
 }
 
 void Gui::newHeading() {
@@ -1795,8 +2237,8 @@ void Gui::updateEditorHint() {
   if (!editor_) return;
   Editor& e = *editor_;
   std::string title = entryText(e.title);
-  Sigils sg;
-  if (e.isNew) sg = parseSigils(title);
+  guidates::Sigils sg;
+  if (e.isNew) sg = guidates::parseSigils(title);
   std::string whenT = sg.hasWhen ? sg.when : entryText(e.when);
   std::string listT = !sg.list.empty() ? sg.list : entryText(e.list);
   auto w = guidates::parse(whenT, true);
@@ -1816,7 +2258,7 @@ void Gui::updateEditorHint() {
     if (!d.value.empty()) parts += std::string(parts.empty() ? "" : "  ·  ") + "Deadline " + d.label;
     if (!l.inbox) parts += std::string(parts.empty() ? "" : "  ·  ") + l.label;
     if (!parts.empty()) msg = parts + "   ";
-    msg += "↵ save   Ctrl+↵ save & new   Esc done";
+    msg += "↵ save   Ctrl+↵ save & new   Ctrl+L checklist   Esc done";
   }
   gtk_label_set_text(GTK_LABEL(e.hint), msg.c_str());
   setClass(e.hint, "error", err);
@@ -1826,8 +2268,8 @@ bool Gui::applyEditor(int& savedId) {
   Editor& e = *editor_;
   savedId = 0;
   std::string rawTitle = entryText(e.title);
-  Sigils sg;
-  if (e.isNew) sg = parseSigils(rawTitle);
+  guidates::Sigils sg;
+  if (e.isNew) sg = guidates::parseSigils(rawTitle);
   std::string title = trimmed(e.isNew ? sg.title : rawTitle);
   if (title.empty()) {
     if (e.isNew) return true;  // nothing typed: just discard
@@ -1845,25 +2287,13 @@ bool Gui::applyEditor(int& savedId) {
   Item it = e.isNew ? Item{} : e.orig;
   it.kind = 't';
   it.title = title;
-  std::string notes = trimmed(textViewText(e.notes));
+  std::string notes = trimmed(md::markdownOf(e.notes));
   while (!notes.empty() && (notes.back() == '\n' || notes.back() == ' ')) notes.pop_back();
   it.notes = notes;
   std::vector<ChecklistItem> cl;
-  {
-    std::string raw = textViewText(e.checklist);
-    size_t p = 0;
-    while (p <= raw.size()) {
-      size_t nl = raw.find('\n', p);
-      std::string line = trimmed(raw.substr(p, nl == std::string::npos ? std::string::npos : nl - p));
-      p = nl == std::string::npos ? raw.size() + 1 : nl + 1;
-      if (line.empty()) continue;
-      bool done = false;
-      if (line.rfind("[x] ", 0) == 0 || line.rfind("[X] ", 0) == 0) { done = true; line = line.substr(4); }
-      else if (line.rfind("[ ] ", 0) == 0) line = line.substr(4);
-      else if (line.rfind("- ", 0) == 0) line = line.substr(2);
-      line = trimmed(line);
-      if (!line.empty()) cl.push_back({done, line});
-    }
+  for (auto& c : e.cl) {
+    std::string t = trimmed(entryText(c->entry));
+    if (!t.empty()) cl.push_back({c->done, t});
   }
   it.checklist = serializeChecklist(cl);
   it.doDate = w.value;  // "" | "someday" | ISO -- Store::saveTask understands the sentinel
@@ -1920,6 +2350,7 @@ bool Gui::finishEditor(bool save, bool thenNew) {
 
 void Gui::showModal(GtkWidget* card, std::function<bool(guint, GdkModifierType)> keyFn, GtkWidget* focus) {
   syncStatLabel_ = syncStat2_ = nullptr;  // about to be destroyed with the old card
+  ++modalGen_;
   clearChildren(modalHost_);
   addClass(card, "modal");
   onClick(card, [] {});  // swallow clicks so they don't reach the scrim
@@ -1935,7 +2366,8 @@ void Gui::closeModal() {
   pal_.reset();
   syncStatLabel_ = syncStat2_ = nullptr;
   gtk_widget_set_visible(modalLayer_, FALSE);
-  later([this] { clearChildren(modalHost_); });
+  unsigned gen = ++modalGen_;
+  later([this, gen] { if (gen == modalGen_) clearChildren(modalHost_); });
   gtk_window_set_focus(GTK_WINDOW(win_), nullptr);
 }
 
@@ -2046,7 +2478,7 @@ void Gui::openPalette(const std::string& placeholder, std::vector<PalItem> items
   gtk_widget_set_margin_top(eb, 14);
   gtk_widget_set_margin_bottom(eb, 12);
   GtkWidget* si = iconWidget(Icon::Search, 18, 0, false);
-  iconTint(si, gPal.fg3);
+  iconRole(si, Role::Fg3);
   gtk_box_append(GTK_BOX(eb), si);
   pal_->entry = gtk_entry_new();
   addClass(pal_->entry, "bare");
@@ -2105,35 +2537,18 @@ std::vector<PalItem> Gui::commandItems() {
   }
   out.push_back({"New To-Do", "", "N", Icon::Plus, 0, false, [this] { later([this] { newTask(); }); }});
   if (view_.kind == View::Project) out.push_back({"New Heading", "", "Shift+N", Icon::Plus, 0, false, [this] { newHeading(); }});
-  out.push_back({"New Project", "", "", Icon::Plus, 0, false, [this] {
-    int area = view_.kind == View::Area ? view_.id : 0;
-    openPrompt("New project", "Project name", "", nullptr, [this, area](const std::string& v) {
-      std::string n = trimmed(v);
-      if (n.empty()) return false;
-      for (auto& p : s_.projects(false)) if (lower(p.name) == lower(n)) { toast("A project with that name already exists", "", true); return false; }
-      for (auto& p : s_.projects(true)) if (lower(p.name) == lower(n)) { toast("A logged project has that name", "", true); return false; }
-      Item p;
-      p.title = n;
-      int id = s_.saveProject(p, area);
-      markDirty();
-      refreshSidebar();
-      goTo(View{View::Project, "", id, n});
-      return true;
-    });
-  }});
-  out.push_back({"New Area", "", "", Icon::Plus, 0, false, [this] {
-    openPrompt("New area", "Area name", "", nullptr, [this](const std::string& v) {
-      std::string n = trimmed(v);
-      if (n.empty()) return false;
-      for (auto& a : s_.areas(false)) if (lower(a.name) == lower(n)) { toast("That area already exists", "", true); return false; }
-      for (auto& a : s_.areas(true)) if (lower(a.name) == lower(n)) { toast("An archived area has that name", "", true); return false; }
-      int id = s_.addArea(n);
-      markDirty();
-      refreshSidebar();
-      goTo(View{View::Area, "", id, n});
-      return true;
-    });
-  }});
+  out.push_back({"New Project", "", "P", Icon::Plus, 0, false, [this] { newProject(); }});
+  out.push_back({"New Area", "", "A", Icon::Plus, 0, false, [this] { newArea(); }});
+  if (view_.kind == View::Project) {
+    out.push_back({"Edit Project…", "", "Shift+E", Icon::Note, 0, false, [this] { editList(); }});
+    if (s_.projectIsOpen(view_.id)) out.push_back({"Complete Project", "", "", Icon::Logbook, 0, false, [this] { completeList(); }});
+    out.push_back({"Show / Hide Logged To-Dos", "", "Shift+L", Icon::Logbook, 0, false, [this] { toggleLogged(); }});
+  }
+  if (view_.kind == View::Area) {
+    out.push_back({"Rename Area…", "", "Shift+E", Icon::Note, 0, false, [this] { editList(); }});
+    out.push_back({"Archive Area", "", "", Icon::Archive, 0, false, [this] { completeList(); }});
+  }
+  if (groupable()) out.push_back({"Group by Area & Project", "", "Shift+A", Icon::Anytime, 0, false, [this] { toggleGrouping(); }});
   out.push_back({"Sync with Remote…", "", "Shift+S", Icon::Sync, 0, false, [this] { openSyncDialog(); }});
   out.push_back({"Undo", "", "Z", Icon::Logbook, 0, false, [this] { undo(); }});
   out.push_back({"Toggle Sidebar", "", "B", Icon::Anytime, 0, false, [this] { toggleSidebar(); }});
@@ -2258,7 +2673,13 @@ void Gui::openHelp() {
                   {"Space  x", "Complete / reopen"}, {"z  Ctrl+Z", "Undo the last completion"},
                   {"↵  e", "Edit, or open a project"}, {"s", "When"}, {"d", "Deadline"}, {"t", "Tags"},
                   {"m", "Move to a list"}, {"J  K", "Reorder"}, {"Backspace", "Delete (asks first)"}}},
-      {"EDITOR", {{"Tab  Shift+Tab", "Next / previous field"}, {"↵", "Save and close"}, {"Ctrl+↵", "Save and add another"}, {"Esc", "Save and close (empty new to-do is discarded)"}}},
+      {"LISTS", {{"p", "New project (in the current area)"}, {"a", "New area"}, {"Shift+E", "Edit the project / rename the area"},
+                 {"Shift+A", "Group by area and project (Today, Tomorrow, Anytime, Someday)"},
+                 {"Shift+L", "Show / hide a project's logged to-dos"}}},
+      {"EDITOR", {{"Tab  Shift+Tab", "Next / previous field (nests a bullet in notes)"}, {"↵", "Save and close"}, {"Ctrl+↵", "Save and add another"},
+                  {"Ctrl+L", "Add a checklist item   (↵ next item, ⌫ on an empty one removes it)"},
+                  {"Notes", "Markdown: * or - makes a bullet, `code`, **bold**, *italic*, # heading, [text](url); links and phone numbers are clickable"},
+                  {"Esc", "Save and close (empty new to-do is discarded)"}}},
       {"SYNC", {{"Shift+S", "Sync dialog: pull, push or both, each confirmed first"}, {"?", "This sheet"}, {"Ctrl+Q", "Quit"}}},
   };
   for (auto& g : groups) {
@@ -2284,6 +2705,202 @@ void Gui::openHelp() {
     if (kv == GDK_KEY_Escape || kv == GDK_KEY_question || kv == GDK_KEY_Return || kv == GDK_KEY_q) closeModal();
     return true;
   });
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// projects, areas, links
+// ---------------------------------------------------------------------------------------------------------------
+
+void Gui::chooseNewList() {
+  std::vector<PalItem> items;
+  items.push_back({"New Project", "A list of to-dos with an end", "P", Icon::Project, 0, false, [this] { newProject(); }});
+  items.push_back({"New Area", "An ongoing part of your life or work", "A", Icon::Area, 0, false, [this] { newArea(); }});
+  openPalette("New list…", std::move(items));
+}
+
+void Gui::newProject() {
+  int area = 0;
+  std::string areaName;
+  if (view_.kind == View::Area) { area = view_.id; areaName = view_.title; }
+  else if (view_.kind == View::Project) { Item cur = s_.getProject(view_.id); area = cur.areaId; areaName = cur.areaName; }
+  openPrompt("New project", "Project name", "", [areaName](const std::string&, bool& ok) {
+    ok = true;
+    return areaName.empty() ? std::string() : "Goes in " + areaName;
+  }, [this, area](const std::string& v) {
+    std::string n = trimmed(v);
+    if (n.empty()) return false;
+    for (auto& p : s_.projects(false)) if (lower(p.name) == lower(n)) { toast("A project with that name already exists", "", true); return false; }
+    for (auto& p : s_.projects(true)) if (lower(p.name) == lower(n)) { toast("A logged project has that name", "", true); return false; }
+    Item p;
+    p.title = n;
+    int id = s_.saveProject(p, area);
+    markDirty();
+    refreshSidebar();
+    goTo(View{View::Project, "", id, n});
+    return true;
+  });
+}
+
+void Gui::newArea() {
+  openPrompt("New area", "Area name", "", nullptr, [this](const std::string& v) {
+    std::string n = trimmed(v);
+    if (n.empty()) return false;
+    for (auto& a : s_.areas(false)) if (lower(a.name) == lower(n)) { toast("That area already exists", "", true); return false; }
+    for (auto& a : s_.areas(true)) if (lower(a.name) == lower(n)) { toast("An archived area has that name", "", true); return false; }
+    int id = s_.addArea(n);
+    markDirty();
+    refreshSidebar();
+    goTo(View{View::Area, "", id, n});
+    return true;
+  });
+}
+
+// Double-click a project's title (or Shift+E): title, notes, dates and area. For an area: rename it.
+void Gui::editList() {
+  if (view_.kind == View::Area) {
+    int id = view_.id;
+    openPrompt("Rename area", "Area name", view_.title, nullptr, [this, id](const std::string& v) {
+      std::string n = trimmed(v);
+      if (n.empty()) return false;
+      s_.renameArea(id, n);
+      markDirty();
+      view_.title = n;
+      refreshSidebar();
+      reload(true);
+      return true;
+    });
+    return;
+  }
+  if (view_.kind != View::Project) return;
+  if (editor_ && !finishEditor(true)) return;
+  Item p = s_.getProject(view_.id);
+  int pid = p.id;
+
+  GtkWidget* card = vbox(0);
+  gtk_widget_set_size_request(card, 580, -1);
+  GtkWidget* inner = vbox(10);
+  gtk_widget_set_margin_start(inner, 22);
+  gtk_widget_set_margin_end(inner, 22);
+  gtk_widget_set_margin_top(inner, 18);
+  gtk_widget_set_margin_bottom(inner, 16);
+  gtk_box_append(GTK_BOX(inner), label("Edit project", "modal-title"));
+
+  GtkWidget* tField = hbox(0);
+  addClass(tField, "field");
+  GtkWidget* te = gtk_entry_new();
+  addClass(te, "bare");
+  addClass(te, "editor-title");
+  gtk_editable_set_text(GTK_EDITABLE(te), p.title.c_str());
+  gtk_widget_set_hexpand(te, TRUE);
+  gtk_box_append(GTK_BOX(tField), te);
+  gtk_box_append(GTK_BOX(inner), tField);
+
+  GtkWidget* nv = nullptr;
+  GtkWidget* nf = hbox(0);
+  addClass(nf, "field");
+  GtkWidget* nw = textArea(p.notes, "Notes — markdown, links and phone numbers work", &nv, 96);
+  gtk_widget_set_hexpand(nw, TRUE);
+  gtk_box_append(GTK_BOX(nf), nw);
+  gtk_box_append(GTK_BOX(inner), nf);
+
+  GtkWidget *we = nullptr, *de = nullptr, *ae = nullptr;
+  GtkWidget* grid = hbox(8);
+  std::string whenText = p.doDate;
+  gtk_box_append(GTK_BOX(grid), editorField("WHEN", &we, whenText, "today, fri, +3d, someday", nullptr));
+  gtk_box_append(GTK_BOX(grid), editorField("DEADLINE", &de, p.deadline, "a hard date", nullptr));
+  gtk_box_append(GTK_BOX(grid), editorField("AREA", &ae, p.areaName, "None", nullptr));
+  gtk_box_append(GTK_BOX(inner), grid);
+
+  auto save = std::make_shared<std::function<bool()>>([this, pid, te, nv, we, de, ae]() {
+    std::string title = trimmed(entryText(te));
+    if (title.empty()) { toast("A project needs a name", "", true); return false; }
+    auto w = guidates::parse(entryText(we), true);
+    auto d = guidates::parse(entryText(de), false);
+    if (!w.ok) { toast("When: couldn't read “" + trimmed(entryText(we)) + "”", "", true); return false; }
+    if (!d.ok) { toast("Deadline: couldn't read “" + trimmed(entryText(de)) + "”", "", true); return false; }
+    int areaId = 0;
+    std::string an = lower(trimmed(entryText(ae)));
+    if (!an.empty() && an != "none") {
+      for (auto& a : s_.areas()) if (lower(a.name) == an) areaId = a.id;
+      if (!areaId) { toast("No area called “" + trimmed(entryText(ae)) + "”", "", true); return false; }
+    }
+    Item q = s_.getProject(pid);
+    q.title = title;
+    q.notes = trimmed(md::markdownOf(nv));
+    q.doDate = w.value;
+    q.deadline = d.value;
+    s_.saveProject(q, areaId);
+    markDirty();
+    view_.title = title;
+    refreshSidebar();
+    reload(true);
+    return true;
+  });
+  GtkWidget* row = hbox(10);
+  gtk_widget_set_halign(row, GTK_ALIGN_END);
+  gtk_widget_set_margin_top(row, 4);
+  gtk_box_append(GTK_BOX(row), button("Cancel", "Esc", "", [this] { closeModal(); }));
+  gtk_box_append(GTK_BOX(row), button("Save", "Ctrl+↵", "primary", [this, save] { if ((*save)()) closeModal(); }));
+  gtk_box_append(GTK_BOX(inner), row);
+  gtk_box_append(GTK_BOX(card), inner);
+  showModal(card, [this, save, nv](guint kv, GdkModifierType st) {
+    if (kv == GDK_KEY_Escape) { closeModal(); return true; }
+    if (kv == GDK_KEY_Return || kv == GDK_KEY_KP_Enter) {
+      GtkWidget* f = gtk_window_get_focus(GTK_WINDOW(win_));
+      bool inNotes = f && f == nv;
+      if (inNotes && !(st & GDK_CONTROL_MASK)) return false;  // a newline (or the next bullet)
+      if ((*save)()) closeModal();
+      return true;
+    }
+    return false;
+  }, te);
+  gtk_editable_set_position(GTK_EDITABLE(te), -1);
+}
+
+void Gui::completeList() {
+  bool project = view_.kind == View::Project;
+  if (!project && view_.kind != View::Area) return;
+  if (project && !s_.projectIsOpen(view_.id)) { toast("Already logged"); return; }
+  Item it;
+  it.id = view_.id;
+  it.kind = project ? 'p' : 'a';
+  std::string title = view_.title;
+  openConfirm(project ? "Complete this project?" : "Archive this area?",
+              "“" + title + "” moves to " + (project ? "Logged Projects" : "Archived Areas") + ". You can undo it right after.",
+              project ? "Complete" : "Archive", false, [this, it, project] {
+                s_.complete(it);
+                undo_.push_back({it.id, it.kind});
+                markDirty();
+                refreshSidebar();
+                goSmart("Today");
+                toast(project ? "Project completed" : "Area archived", "Z");
+              });
+}
+
+void Gui::openLink(const std::string& url) {
+  struct Ctx { Gui* g; std::string url; };
+  GtkUriLauncher* l = gtk_uri_launcher_new(url.c_str());
+  gtk_uri_launcher_launch(l, GTK_WINDOW(win_), nullptr, +[](GObject* src, GAsyncResult* res, gpointer d) {
+    auto* c = static_cast<Ctx*>(d);
+    GError* err = nullptr;
+    gboolean ok = gtk_uri_launcher_launch_finish(GTK_URI_LAUNCHER(src), res, &err);
+    bool dismissed = err && g_error_matches(err, GTK_DIALOG_ERROR, GTK_DIALOG_ERROR_DISMISSED);
+    if (err) g_error_free(err);
+    if (!ok && !dismissed) c->g->linkFallback(c->url);
+    g_object_unref(src);
+    delete c;
+  }, new Ctx{this, url});
+}
+
+// No handler for the scheme (typically tel: on a desktop with no phone app): put the number on the clipboard instead.
+void Gui::linkFallback(const std::string& url) {
+  auto copy = [&](const std::string& text, const char* msg) {
+    gdk_clipboard_set_text(gtk_widget_get_clipboard(win_), text.c_str());
+    toast(msg);
+  };
+  if (url.rfind("tel:", 0) == 0) copy(url.substr(4), "No phone app found — number copied");
+  else if (url.rfind("mailto:", 0) == 0) copy(url.substr(7), "No mail app found — address copied");
+  else toast("Couldn't open " + url, "", true);
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -2443,7 +3060,7 @@ void Gui::openSyncDialog() {
     gtk_widget_set_margin_start(r, 0);
     gtk_widget_set_margin_end(r, 0);
     GtkWidget* i = iconWidget(ic, 20, 0, false);
-    if (primary) iconTint(i, gPal.accent);
+    if (primary) iconRole(i, Role::Accent);
     gtk_box_append(GTK_BOX(r), i);
     GtkWidget* col = vbox(1);
     gtk_widget_set_hexpand(col, TRUE);
@@ -2581,6 +3198,7 @@ bool Gui::onKey(guint kv, GdkModifierType st) {
   if (auto keep = modalKey_) return (*keep)(kv, st);
 
   if (editor_) {
+    if (editorKey(kv, st)) return true;
     GtkWidget* f = gtk_window_get_focus(GTK_WINDOW(win_));
     bool inTextView = f && GTK_IS_TEXT_VIEW(f);
     if (kv == GDK_KEY_Escape) { finishEditor(true); return true; }
@@ -2659,6 +3277,11 @@ bool Gui::onListKey(guint kv, GdkModifierType) {
     case GDK_KEY_question: openHelp(); return true;
     case GDK_KEY_b: toggleSidebar(); return true;
     case GDK_KEY_S: openSyncDialog(); return true;
+    case GDK_KEY_p: newProject(); return true;
+    case GDK_KEY_a: newArea(); return true;
+    case GDK_KEY_A: toggleGrouping(); return true;
+    case GDK_KEY_E: editList(); return true;
+    case GDK_KEY_L: toggleLogged(); return true;
     case GDK_KEY_h: case GDK_KEY_Left: {
       if (!gtk_revealer_get_reveal_child(GTK_REVEALER(sbRevealer_))) toggleSidebar();
       sbFocus_ = true;
@@ -2676,6 +3299,9 @@ bool Gui::onListKey(guint kv, GdkModifierType) {
 }
 
 void Gui::poll() {
+  // Themes can change by routes GTK doesn't announce (a portal colour-scheme flip, an edited stylesheet), so look again
+  // every few ticks; applyTheme() does nothing unless a colour actually moved.
+  if (themeCssStamp() != themeStamp_ || ++pollTick_ % 3 == 0) applyTheme(false);
   int v = s_.dataVersion();
   if (v == lastDataVersion_) return;
   for (auto& r : rows_) if (r->pendingRemoval || r->animating) return;  // let a check-off finish first; try again next tick

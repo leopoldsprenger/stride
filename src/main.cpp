@@ -124,7 +124,7 @@ int runQuickCaptureCmd(bool forceTui) {
 
 // `--json <view> [arg]`, `--complete <id> [--kind t|p]`, `--quick-add
 // <title> [--list <name>] [--date <date>]` -- the scriptable surface used
-// by the bar widget (and anything else that'd rather shell out than link
+// by scripts and status bars (anything that'd rather shell out than link
 // against Stride). See cli_json.h for what each view prints.
 int runJsonCmd(int argc, char** argv, int start) {
   std::string view = start < argc ? argv[start] : "";
